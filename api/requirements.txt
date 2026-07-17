@@ -1,0 +1,8 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
+httpx>=0.27
+faster-whisper>=1.0
+numpy>=1.24,<2
+# TTS uses the standalone Piper binary (scripts/download_piper.sh), not a pip
+# package — piper-tts's piper-phonemize dep has no Linux wheels.
