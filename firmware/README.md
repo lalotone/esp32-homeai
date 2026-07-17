@@ -7,8 +7,22 @@ Board hardware in play: ES7210 4-mic ADC array, ES8311 DAC/speaker codec, TCA955
 
 ## Prerequisites
 
-- ESP-IDF v6.0.2 installed (this project was built/tested against that version specifically — the code needed patching to compile against it, see below).
-- Board connected via USB. It enumerates as a USB-Serial/JTAG port, e.g. `/dev/ttyACM0` on Linux (or `/dev/ttyUSB0` if using an external UART bridge instead).
+- ESP-IDF v6.0.2 installed (this project was built/tested against that version specifically — the code needed patching to compile against it, see below). If you don't have it yet:
+
+  ```bash
+  # System packages ESP-IDF's installer itself needs (Fedora):
+  sudo dnf install git wget flex bison gperf python3 cmake ninja-build ccache dfu-util libusbx
+
+  # Debian/Ubuntu equivalent:
+  # sudo apt install git wget flex bison gperf python3 python3-pip python3-venv cmake ninja-build ccache libffi-dev libssl-dev dfu-util libusb-1.0-0
+
+  git clone -b v6.0.2 --recursive https://github.com/espressif/esp-idf.git ~/.espressif/v6.0.2/esp-idf
+  ~/.espressif/v6.0.2/esp-idf/install.sh esp32s3
+  ```
+
+  See [Espressif's official get-started guide](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/get-started/linux-macos-setup.html) if anything above doesn't match your setup.
+
+- Board connected via USB. It enumerates as a USB-Serial/JTAG port, e.g. `/dev/ttyACM0` on Linux (or `/dev/ttyUSB0` if using an external UART bridge instead). If flashing fails with a permissions error (not the "no serial data" kind below, an outright "Permission denied" on the port), add yourself to the group that owns it and log out/in — usually `dialout` (`sudo usermod -aG dialout $USER`), occasionally `uucp` on some distros; check with `ls -l /dev/ttyACM0`.
 - A WiFi network and a server on that network to receive/answer voice requests (see "Voice assistant setup" below) — without this configured, the device still boots and runs the local voice commands, it just can't reach the assistant. The [`api`](../api) service in this repo implements the server side.
 
 ## Repo layout
@@ -37,6 +51,8 @@ idf.py -p /dev/ttyACM0 flash monitor
 ```
 
 (Exit the monitor with `Ctrl+]`.)
+
+**If flashing fails with `Failed to connect... No serial data received`:** first check `ls /dev/ttyUSB* /dev/ttyACM*` — some boards/cables expose more than one serial device, and the wrong one gives exactly this error rather than a clearer "not found." If you're on the right port and it still fails, put the board in bootloader mode manually: hold **BOOT**, tap **RESET** while still holding BOOT, then release — some USB-serial adapters (older PL2303/CH340-based ones especially) don't drive the auto-reset lines ESP-IDF expects.
 
 ## Run
 
@@ -92,7 +108,7 @@ Plain HTTP is fine for a server on your LAN; HTTPS also works since `esp_http_cl
 
 The response is capped at 2MB (~64s of audio) and played back with no parsing beyond "treat every 2 bytes as one sample" — so if you're generating it with a TTS API that returns WAV or MP3, strip the container/decode to raw PCM at that exact rate before sending it back (e.g. with `pydub`/`ffmpeg`, or your TTS provider's raw-PCM output option if it has one).
 
-> **Known mismatch:** `api`'s `/talk` currently returns a real WAV file (44-byte header included, via Python's `wave` module in `app/tts.py`), not headerless raw PCM as the contract above specifies — and this firmware's `voice_assistant.c` doesn't strip that header before playback. In practice this means every assistant reply starts with ~22 samples (1.4ms) of header bytes misread as audio, likely an audible click. Not fixed yet on either side; worth doing before relying on this for real use.
+`api`'s `/talk` actually returns a real WAV file (44-byte header included, via Python's `wave` module in `app/tts.py`), not headerless raw PCM as the table above specifies. `voice_assistant.c` handles this: `find_pcm_payload()` walks the RIFF/WAVE chunk headers to find where the `data` sub-chunk actually starts and only plays back from there, rather than assuming a fixed 44-byte offset — so it also still works unmodified against a server that follows the documented contract literally and returns headerless raw PCM (it just falls through to treating the whole body as PCM if it doesn't look like a WAV container at all).
 
 **Building your own server instead of using `api`:** receive the WAV, run speech-to-text, send the transcript to an LLM, synthesize the reply with TTS, convert that to raw PCM16 mono 16kHz, and return it as the response body. A minimal Python/Flask skeleton to validate the ESP round trip before wiring up real STT/LLM/TTS (it just echoes a 1-second beep back so you can confirm audio flows both ways):
 
@@ -371,3 +387,9 @@ Added `main/app_config_driver/app_config.c`/`.h` and `main/config_portal_driver/
 - Holding the **BOOT** button (GPIO0 — otherwise unused by app code once flashed) through power-on/reset skips the connect attempt entirely and opens the portal immediately, for reconfiguring a board that would otherwise connect fine.
 
 **One real bug hit and fixed along the way:** while the portal AP was up, `wifi_conn.c`'s disconnect handler kept calling `esp_wifi_connect()` on every retry against the (by-definition, at that point) unreachable saved network. Each attempt does a full channel scan, which — on this single-radio chip in `APSTA` mode — briefly knocks the softAP off the air, making the portal page flaky/unreachable exactly when it's needed most. Fixed by skipping the STA reconnect loop entirely while the portal is active; not worth fighting for background reconnection during that window since saving new config through the portal reboots the board anyway.
+
+### 14. Fixed: assistant responses playing a WAV header as audio
+
+`api`'s `/talk` (see [`../api`](../api)) returns a proper WAV file, 44-byte header included, but `voice_assistant.c`'s `play_mono_pcm()` treated the entire HTTP response body as headerless raw PCM16 — so every reply started with ~22 samples (1.4ms) of header bytes (`RIFF`, format fields, etc.) misread as audio, an audible click before the actual speech.
+
+Added `find_pcm_payload()` in `voice_assistant.c`: walks the RIFF/WAVE chunk headers (`pos = 12`, then `chunk_id` + `chunk_size` pairs, each padded to an even byte boundary) to find the real `data` sub-chunk and its length, rather than assuming a fixed 44-byte offset — robust to a server emitting extra chunks before `data`. If the response doesn't start with a `RIFF`/`WAVE` container at all, it falls straight through to the old behavior (whole body treated as raw PCM), so a server that already implements the "no header" contract as originally documented needs no changes either.

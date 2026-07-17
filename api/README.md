@@ -18,13 +18,15 @@ ESP32 (speaker) <--WAV-- response <----'
 
 ## Setup
 
+Needs [`uv`](https://docs.astral.sh/uv/) (`curl -LsSf https://astral.sh/uv/install.sh | sh`, or `dnf install uv` on Fedora 41+/`pip install uv` anywhere else) and `curl`/`tar` for the download scripts — no other system packages required. You don't need Python 3.12 pre-installed either; `uv` downloads a matching interpreter itself if your system one doesn't match.
+
 ```bash
 # Use Python 3.12 — faster-whisper deps may lack wheels on 3.13+
 uv venv --python 3.12 .venv
 uv pip install --python .venv -r requirements.txt
 
 # TTS: the standalone Piper binary -> ./piper/  (avoids the piper-phonemize
-# pip package, which has no Linux wheels)
+# pip package, which has no Linux wheels; x86_64 only, see script for details)
 ./scripts/download_piper.sh
 
 # Download the default Piper voice into ./voices/
@@ -48,12 +50,19 @@ Bind to `0.0.0.0` so the ESP32 can reach it from the LAN.
 ## Test without an ESP32
 
 ```bash
-# record 4s from your mic (needs ffmpeg)
+# record 4s from your mic (needs ffmpeg; on Fedora, `dnf install ffmpeg` from
+# the RPM Fusion repo, since the stock repos only ship the -free build)
 ffmpeg -f alsa -i default -ac 1 -ar 16000 -sample_fmt s16 -t 4 input.wav
 
 ./scripts/test_talk.sh input.wav
 # -> prints X-Transcript / X-Reply headers, saves reply.wav
 ```
+
+If `-f alsa -i default` can't find a device, your system is likely on PipeWire
+without its ALSA compatibility layer (`pipewire-alsa` on Fedora, usually
+installed by default on Workstation but not Server/minimal installs) — or
+just record with any other tool and pass the resulting WAV to
+`test_talk.sh` instead.
 
 ## API
 
@@ -67,11 +76,11 @@ content-type, byte count, and transcript for each request.
 
 `GET /health` — `{"status": "ok"}`.
 
-## ESP32 side (not included here)
+## ESP32 side
 
-The firmware should record mono 16-bit PCM (16 kHz is ideal) into a WAV, POST it
-as multipart field `audio` to `http://<host>:8000/talk`, then stream the WAV in
-the response to an I2S DAC (e.g. MAX98357A). Typical mic: INMP441.
+The [`firmware/`](../firmware) folder in this repo implements the other end: records mono 16-bit 16 kHz PCM into a WAV, POSTs it as the raw request body (not multipart) to `http://<host>:8000/talk` on hearing the **"assistant"** voice command, and plays the response back. See [`firmware/README.md`](../firmware/README.md) for the board it targets and how to configure the URL.
+
+This endpoint returns a real WAV file (header included, via `wave.open()` in `app/tts.py`), not headerless raw PCM. The firmware handles this on its end — `find_pcm_payload()` in `voice_assistant.c` locates the actual `data` sub-chunk before playback instead of assuming either a fixed offset or a headerless body — so nothing needs to change here.
 
 ## Configuration
 

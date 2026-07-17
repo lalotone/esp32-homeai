@@ -135,6 +135,39 @@ static esp_err_t http_post_and_read(const char *url, const uint8_t *body, size_t
     return ESP_OK;
 }
 
+// Finds the "data" sub-chunk of what may be a WAV file, so a server that
+// responds with a real WAV (header included -- e.g. Python's `wave` module)
+// plays back correctly instead of ~22 header bytes being misread as noise
+// up front. Falls back to treating the whole buffer as headerless raw PCM
+// if it doesn't start with a RIFF/WAVE container, so a server that already
+// implements the "no header" contract keeps working unchanged.
+static void find_pcm_payload(const uint8_t *buf, size_t len, const uint8_t **out_pcm, size_t *out_len)
+{
+    *out_pcm = buf;
+    *out_len = len;
+
+    if (len < 12 || memcmp(buf, "RIFF", 4) != 0 || memcmp(buf + 8, "WAVE", 4) != 0) {
+        return;
+    }
+
+    size_t pos = 12; // first sub-chunk starts right after the 12-byte RIFF/WAVE header
+    while (pos + 8 <= len) {
+        uint32_t chunk_size;
+        memcpy(&chunk_size, buf + pos + 4, sizeof(chunk_size)); // WAV fields are little-endian, same as this chip
+        size_t data_start = pos + 8;
+
+        if (memcmp(buf + pos, "data", 4) == 0) {
+            size_t avail = len - data_start;
+            *out_pcm = buf + data_start;
+            *out_len = (chunk_size < avail) ? chunk_size : avail;
+            return;
+        }
+
+        pos = data_start + chunk_size + (chunk_size & 1); // chunks are padded to even byte boundaries
+    }
+    // No "data" chunk found before EOF -- leave the raw-PCM fallback set above.
+}
+
 // Plays raw mono 16-bit PCM at AUDIO_CAPTURE_SAMPLE_RATE by duplicating it
 // into a stereo buffer, since the DAC is opened as a 2-channel device.
 static esp_err_t play_mono_pcm(const int16_t *mono, int frames)
@@ -208,18 +241,22 @@ esp_err_t voice_assistant_ask(void)
         return ret;
     }
 
-    if (resp_len < sizeof(int16_t)) {
-        ESP_LOGW(TAG, "Empty or too-short response (%u bytes)", (unsigned)resp_len);
+    const uint8_t *pcm_data = NULL;
+    size_t pcm_len = 0;
+    find_pcm_payload(resp_buf, resp_len, &pcm_data, &pcm_len);
+
+    if (pcm_len < sizeof(int16_t)) {
+        ESP_LOGW(TAG, "Empty or too-short response (%u bytes)", (unsigned)pcm_len);
         free(resp_buf);
         mic_speech_pause_feed(false);
         led_ring_off();
         return ESP_OK;
     }
 
-    int resp_frames = resp_len / sizeof(int16_t);
+    int resp_frames = pcm_len / sizeof(int16_t);
     ESP_LOGI(TAG, "Playing back %d frame response...", resp_frames);
     led_ring_set_color(0, 128, 255); // blue: playing back the response
-    play_mono_pcm((const int16_t *)resp_buf, resp_frames);
+    play_mono_pcm((const int16_t *)pcm_data, resp_frames);
     free(resp_buf);
 
     mic_speech_pause_feed(false);
