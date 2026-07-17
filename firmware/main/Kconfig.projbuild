@@ -1,0 +1,42 @@
+menu "ESP SR Demo Configuration"
+
+    config ESP_WIFI_SSID
+        string "WiFi SSID"
+        default "YourWiFiSSID"
+        help
+            SSID (network name) the board should connect to. Only used as a
+            factory-default fallback -- see the config portal note below.
+
+    config ESP_WIFI_PASSWORD
+        string "WiFi Password"
+        default "YourWiFiPassword"
+        help
+            WPA2 password for the WiFi network above.
+
+    config VOICE_ASSISTANT_ENDPOINT_URL
+        string "Voice assistant HTTP endpoint URL"
+        default "http://192.168.1.100:8000/talk"
+        help
+            HTTP endpoint the board POSTs recorded audio to after hearing
+            the wake word (mono, 16-bit PCM, 16kHz WAV), and reads a spoken
+            response back from (raw mono 16-bit PCM, 16kHz, no header).
+            See README.md for the full contract.
+
+            This is only the factory-default value baked into the first
+            boot. Both this and the WiFi SSID/password above can be changed
+            later, without reflashing, via the config portal (see
+            PORTAL_AP_SSID_PREFIX below) -- whatever was last saved there
+            takes priority over these Kconfig defaults.
+
+    config PORTAL_AP_SSID_PREFIX
+        string "Config portal AP SSID prefix"
+        default "ESP32-Setup"
+        help
+            If the board can't connect to WiFi within the connect timeout,
+            it brings up an open access point named "<prefix>-XXXX" (last
+            two bytes of the AP MAC) alongside its normal retry attempts.
+            Join that AP and browse to http://192.168.4.1/ to enter a new
+            WiFi SSID/password and/or a new voice assistant endpoint URL;
+            saving reboots the board with the new settings.
+
+endmenu

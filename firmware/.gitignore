@@ -1,0 +1,13 @@
+# ESP-IDF build output and tool caches
+build/
+managed_components/
+.cache/
+
+# Backup written by `idf.py menuconfig`/`reconfigure` on top of an existing
+# sdkconfig -- not needed, sdkconfig itself is committed (see README: it's
+# what actually captures flash size / PSRAM mode / WakeNet+MultiNet model
+# selection / command phrases -- sdkconfig.defaults alone isn't enough to
+# reproduce a working build). Committed sdkconfig carries placeholder WiFi
+# credentials only; double-check before committing after local menuconfig
+# use, since real ones are easy to leave baked in by accident.
+sdkconfig.old
