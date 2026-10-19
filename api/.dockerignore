@@ -1,0 +1,7 @@
+# Only requirements.txt, app/ and the scripts the Dockerfile copies go in. Never the private bits.
+*
+!requirements.txt
+!app/
+!scripts/download_models.py
+!scripts/docker_entrypoint.sh
+**/__pycache__/

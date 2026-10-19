@@ -91,6 +91,39 @@ journalctl --user -u esp32-homeai-api -f  # logs
 It writes `~/.config/systemd/user/esp32-homeai-api.service` for this checkout's path, with `MALLOC_ARENA_MAX=2`.
 Without `--enable` it only writes the unit.
 
+## Docker
+
+One `Dockerfile` builds both flavours (`TORCH` build arg). `docker-compose.yml` has a profile for each:
+
+```bash
+docker compose --profile cpu up -d --build    # CPU
+docker compose --profile gpu up -d --build    # NVIDIA GPU (cu128 torch; needs the NVIDIA Container Toolkit)
+docker compose logs -f
+```
+
+or without compose:
+
+```bash
+docker build -t esp32-homeai-api:cuda --build-arg TORCH=cu128 .
+docker run -d --gpus 1 -p 8000:8000 \
+  -v "$PWD/rocky:/app/rocky:ro" -v hf-cache:/cache/hf \
+  -e TTS_DEVICE=cuda -e WHISPER_DEVICE=cuda -e WHISPER_COMPUTE_TYPE=float16 \
+  -e LLM_BASE_URL=http://<llm-host>:11434/v1 esp32-homeai-api:cuda
+```
+
+- **Nothing private is in the image.** The voice reference is a read-only bind mount (`./rocky` → `/app/rocky`), and
+  `.dockerignore` only lets `requirements.txt`, `app/` and two scripts in. The container refuses to start
+  without the reference and says how to provide it.
+- **Models live in the `hf-cache` volume**, downloaded on the first start (~2.5 GB) by the entrypoint
+  (`scripts/docker_entrypoint.sh` → `download_models.py`). Later starts only check the cache, or skip the network
+  entirely with `HF_HUB_OFFLINE=1`.
+- **LLM address**: inside a container `localhost` is the container itself. Compose defaults to Ollama on the host
+  (`host.docker.internal:11434`); set `DOCKER_LLM_BASE_URL` for anything else (e.g. `http://heavy1:30800/v1`).
+  `.env` is shared with the native run for every other setting.
+- **Image size**: CPU ~2 GB; CUDA several GB (the torch wheels bundle CUDA + cuDNN, which faster-whisper reuses via
+  `LD_LIBRARY_PATH`).
+- Runs as a non-root user, has a `/health` healthcheck, and sets `MALLOC_ARENA_MAX=2`.
+
 ## Speed and memory
 
 - **CPU-only laptop** (tested on a Ryzen 7 4700U): Rocky takes ~60 s for one short sentence, so a full `/talk`

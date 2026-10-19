@@ -1,0 +1,58 @@
+# Pick one profile:
+#   docker compose --profile cpu up -d --build
+#   docker compose --profile gpu up -d --build     # needs the NVIDIA Container Toolkit on the host
+#
+# Before the first start: put Rocky's voice reference in ./rocky (see rocky/README.md).
+# Settings: ./.env is optional (same file as the native run). The LLM address is the exception:
+# set DOCKER_LLM_BASE_URL (e.g. in .env) if the LLM isn't Ollama on this host.
+
+x-api: &api
+  ports:
+    - "8000:8000"
+  volumes:
+    - ./rocky:/app/rocky:ro         # private voice reference, never baked into the image
+    - hf-cache:/cache/hf            # Whisper + Qwen3-TTS, downloaded on the first start
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    # Inside a container "localhost" is the container itself, so .env's LLM_BASE_URL (for the native
+    # run) can't be reused here. This wins over env_file. Default: Ollama on the host.
+    LLM_BASE_URL: ${DOCKER_LLM_BASE_URL:-http://host.docker.internal:11434/v1}
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  restart: unless-stopped
+
+services:
+  api-cpu:
+    <<: *api
+    profiles: ["cpu"]
+    image: esp32-homeai-api:cpu
+    build:
+      context: .
+      args:
+        TORCH: cpu
+
+  api-gpu:
+    <<: *api
+    profiles: ["gpu"]
+    image: esp32-homeai-api:cuda
+    build:
+      context: .
+      args:
+        TORCH: cu128
+    environment:
+      LLM_BASE_URL: ${DOCKER_LLM_BASE_URL:-http://host.docker.internal:11434/v1}
+      TTS_DEVICE: cuda
+      WHISPER_DEVICE: cuda
+      WHISPER_COMPUTE_TYPE: float16
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  hf-cache:
