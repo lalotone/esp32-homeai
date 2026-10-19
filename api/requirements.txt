@@ -3,6 +3,10 @@ uvicorn[standard]>=0.29
 python-multipart>=0.0.9
 httpx>=0.27
 faster-whisper>=1.0
-numpy>=1.24,<2
-# TTS uses the standalone Piper binary (scripts/download_piper.sh), not a pip
-# package — piper-tts's piper-phonemize dep has no Linux wheels.
+numpy>=2
+# TTS: Rocky's voice via Qwen3-TTS. CPU wheels by default; for an NVIDIA GPU swap the index
+# for https://download.pytorch.org/whl/cu128 (RTX 50-series needs cu128) and set TTS_DEVICE=cuda.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.9.1
+torchaudio==2.9.1
+qwen-tts==0.1.1

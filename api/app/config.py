@@ -24,7 +24,12 @@ def _load_dotenv() -> None:
             continue
         key, _, value = line.partition("=")
         key = key.strip()
-        value = value.strip().strip('"').strip("'")
+        value = value.strip()
+        if value[:1] in ("'", '"'):
+            value = value.strip('"').strip("'")
+        else:
+            # Unquoted: drop an inline comment (`WHISPER_DEVICE=cpu   # or: cuda`), as in .env.example.
+            value = "" if value.startswith("#") else value.split(" #", 1)[0].split("\t#", 1)[0].strip()
         os.environ.setdefault(key, value)
 
 
@@ -41,13 +46,28 @@ class Settings:
     llm_base_url: str = _get("LLM_BASE_URL", "http://localhost:11434/v1")
     llm_api_key: str = _get("LLM_API_KEY", "not-needed")
     llm_model: str = _get("LLM_MODEL", "llama3.2")
+    # Rocky's personality as a general home assistant (like Alexa): useful answers on anything,
+    # spoken the Rocky way. The voice sounds best with his grammar.
     system_prompt: str = _get(
         "SYSTEM_PROMPT",
-        "You are a helpful voice assistant. Answer in a few short, natural "
-        "sentences suitable for being read aloud. Do not use markdown, lists, "
-        "or emoji.",
+        "You are Rocky, the Eridian engineer from Project Hail Mary, now working as a helpful home voice "
+        "assistant, like Alexa. Your job is to really help: answer the user's actual question correctly and "
+        "usefully (facts, math, unit conversions, cooking, health basics, advice, explanations, ideas, "
+        "jokes). For numbers, work the math out carefully before answering and say the final number itself, "
+        "not just the method. Talk the Rocky way, always: broken simple English, drop \"the\", \"a\", \"is\", \"are\""
+        " and helper verbs (\"Water boil at 100 degrees.\", \"Two hours is 120 minutes.\"). Often say \"Rocky\" "
+        "instead of \"I\". Triple words for emphasis (\"Good, good, good!\", \"Bad, bad, bad.\"). Love exact "
+        "numbers. Warm, loyal, curious. Add the spoken word \"question\" ONLY at the end of a question YOU ask "
+        "the user (\"You want recipe, question?\"). Never put \"question\" after a statement or an answer. Do not"
+        " talk about Erid, Grace, space or the movie unless the user asks. If you cannot know something (live"
+        " weather, news, the time) or cannot do it (timers, lights, music), say so simply. Never pretend or "
+        "promise to do things you cannot do. Reply ONLY with the words to speak aloud: no stage directions, "
+        "no emoji, no markdown, no lists. Keep it to 1-3 short sentences.",
     )
     llm_timeout_s: float = float(_get("LLM_TIMEOUT_S", "120"))
+    # Ollama only: how long the model stays loaded after a reply ("0" = unload right away,
+    # freeing its RAM before Rocky's voice runs). Empty = don't send it (server default).
+    llm_keep_alive: str = _get("LLM_KEEP_ALIVE", "")
 
     # --- STT (faster-whisper) ---
     whisper_model: str = _get("WHISPER_MODEL", "base")
@@ -56,12 +76,16 @@ class Settings:
     # Force a language (e.g. "en") or leave empty to auto-detect.
     whisper_language: str = _get("WHISPER_LANGUAGE", "")
 
-    # --- TTS (Piper standalone binary) ---
-    # Path to the piper executable (from scripts/download_piper.sh) or "piper"
-    # if it's on your PATH.
-    piper_bin: str = _get("PIPER_BIN", "piper/piper")
-    # Path to a Piper .onnx voice; its <name>.onnx.json config must sit beside it.
-    piper_model: str = _get("PIPER_MODEL", "voices/en_US-lessac-medium.onnx")
+    # --- TTS (Rocky's voice: Qwen3-TTS Base, zero-shot clone) ---
+    # Hugging Face id or local path of the Qwen3-TTS Base model.
+    tts_model: str = _get("TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-Base")
+    tts_device: str = _get("TTS_DEVICE", "cpu")  # or: cuda (bf16)
+    # The voice is cloned from this clip + its exact transcript (scripts/get_rocky_voice.sh).
+    tts_ref_audio: str = _get("TTS_REF_AUDIO", "rocky/rocky_ref.wav")
+    tts_ref_text: str = _get("TTS_REF_TEXT", "rocky/rocky_ref.txt")
+    tts_temperature: float = float(_get("TTS_TEMPERATURE", "0.9"))
+    # Language Qwen3-TTS speaks in (English, Spanish, ...). The voice was tuned in English.
+    tts_language: str = _get("TTS_LANGUAGE", "English")
 
     # --- Output audio, shaped for the ESP32 I2S DAC (e.g. MAX98357A) ---
     # 16 kHz / 16-bit / mono is a safe default for small ESP32 speakers.

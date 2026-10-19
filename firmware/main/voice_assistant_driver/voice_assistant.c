@@ -20,7 +20,9 @@ static const char *TAG = "voice_assistant";
 // A real server does STT -> LLM -> TTS as three sequential blocking calls
 // before it can respond at all, which can easily take longer than a plain
 // API round trip -- give it real headroom rather than timing out mid-chain.
-#define HTTP_TIMEOUT_MS      60000
+// 180s: a CPU-only server using the Rocky voice (Qwen3-TTS) takes ~60-90s for the TTS
+// step alone. A GPU-hosted voice answers in a few seconds, well inside this.
+#define HTTP_TIMEOUT_MS      180000
 // Response is played fully into PSRAM before playback starts, so cap it to
 // something sane (2MB ~= 64s of mono 16-bit 16kHz audio) rather than trusting
 // a server-supplied Content-Length unconditionally.

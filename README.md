@@ -1,6 +1,7 @@
 # esp32-homeai
 
-A self-hosted voice assistant for the ESP32: speak to it, and it answers out loud.
+A self-hosted voice assistant for the ESP32: speak to it, and it answers out loud, as **Rocky** from
+*Project Hail Mary* (his voice and his "Good, good, good!" personality).
 Speech-to-text, the language model, and text-to-speech all run on your own machine.
 
 ```
@@ -12,8 +13,17 @@ ESP32 (speaker) <--WAV-- response <-----------------'
 
 | Folder | What it is |
 | --- | --- |
-| [`api/`](api/) | Python service that does the work: WAV in, STT → LLM → TTS, spoken WAV out. See [`api/README.md`](api/README.md). |
+| [`api/`](api/) | Python service that does the work: WAV in, STT (Whisper) → LLM (any OpenAI-compatible endpoint) → TTS (Rocky's voice, Qwen3-TTS), spoken WAV out. See [`api/README.md`](api/README.md). |
 | [`firmware/`](firmware/) | ESP-IDF firmware — wake word, local voice commands, records the clip, POSTs it, plays the reply. Includes a WiFi config portal for on-device setup. See [`firmware/README.md`](firmware/README.md). |
+
+## Quick start
+
+1. **Server**: `cd api && ./scripts/first_run.sh`. It installs everything and downloads the models. It also tells you
+   about the two private pieces that aren't in git: Rocky's voice reference and your `.env`. See
+   [`api/README.md`](api/README.md). Then `./scripts/install_service.sh --enable` keeps it running.
+2. **LLM**: any OpenAI-compatible endpoint (Ollama, vLLM, ...) set in `api/.env`.
+3. **Board**: build + flash [`firmware/`](firmware/), then set WiFi and `http://<server LAN IP>:8000/talk` in its
+   config portal. Say **"Alexa"**, then **"assistant"**, then your question.
 
 ## Hardware
 

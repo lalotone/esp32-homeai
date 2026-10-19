@@ -20,6 +20,8 @@ async def chat(user_text: str) -> str:
         "temperature": 0.7,
         "stream": False,
     }
+    if settings.llm_keep_alive:
+        payload["keep_alive"] = int(settings.llm_keep_alive) if settings.llm_keep_alive.isdigit() else settings.llm_keep_alive
     headers = {"Authorization": f"Bearer {settings.llm_api_key}"}
 
     async with httpx.AsyncClient(timeout=settings.llm_timeout_s) as client:

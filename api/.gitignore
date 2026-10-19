@@ -3,7 +3,7 @@ __pycache__/
 .venv/
 venv/
 .env
-voices/
-piper/
+rocky/*
+!rocky/README.md
 *.wav
 headers.txt

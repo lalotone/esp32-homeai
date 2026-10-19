@@ -1,51 +1,121 @@
 # ESP32 Voice Assistant API
 
-A small Python service that turns a voice clip into a spoken answer, all offline
-except for whatever LLM endpoint you point it at.
+A small Python service that turns a voice clip into a spoken answer **in Rocky's voice** (the Eridian engineer from
+*Project Hail Mary*). Speech-to-text and text-to-speech run in this process; the only outside call is to whatever
+LLM endpoint you point it at.
 
 ```
 ESP32 (mic) --WAV--> POST /talk --> STT (faster-whisper)
                                       -> LLM (your OpenAI-compatible endpoint)
-                                      -> TTS (Piper)
+                                      -> TTS (Rocky: Qwen3-TTS voice clone)
 ESP32 (speaker) <--WAV-- response <----'
 ```
 
 ## Pipeline
 
-1. **STT** — [faster-whisper](https://github.com/SYSTRAN/faster-whisper) transcribes the uploaded WAV.
-2. **LLM** — the transcript is sent to any OpenAI-compatible `/chat/completions` endpoint (Ollama, llama.cpp, LM Studio, vLLM…).
-3. **TTS** — the [Piper](https://github.com/rhasspy/piper) standalone binary synthesizes the reply and it's downsampled to a 16 kHz / 16-bit / mono WAV the ESP32 can play.
+1. **STT**: [faster-whisper](https://github.com/SYSTRAN/faster-whisper) transcribes the uploaded WAV.
+2. **LLM**: the transcript goes to any OpenAI-compatible `/chat/completions` endpoint (Ollama, llama.cpp, LM Studio,
+   vLLM…). The default system prompt gives it Rocky's personality ("Rocky fix ship. Good, good, good!").
+3. **TTS**: [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) 12Hz 0.6B Base clones Rocky's voice zero-shot from a
+   reference clip plus its exact transcript, picked by ear in the Rocky voice project (`~/src/repos/rocky`). The reply is
+   downsampled to a 16 kHz / 16-bit / mono WAV the ESP32 can play.
 
 ## Setup
 
-Needs [`uv`](https://docs.astral.sh/uv/) (`curl -LsSf https://astral.sh/uv/install.sh | sh`, or `dnf install uv` on Fedora 41+/`pip install uv` anywhere else) and `curl`/`tar` for the download scripts — no other system packages required. You don't need Python 3.12 pre-installed either; `uv` downloads a matching interpreter itself if your system one doesn't match.
+Needs [`uv`](https://docs.astral.sh/uv/) (`curl -LsSf https://astral.sh/uv/install.sh | sh`, or `dnf install uv` on
+Fedora 41+/`pip install uv` anywhere else). You don't need Python 3.12 pre-installed; `uv` fetches it.
 
 ```bash
-# Use Python 3.12 — faster-whisper deps may lack wheels on 3.13+
-uv venv --python 3.12 .venv
-uv pip install --python .venv -r requirements.txt
-
-# TTS: the standalone Piper binary -> ./piper/  (avoids the piper-phonemize
-# pip package, which has no Linux wheels; x86_64 only, see script for details)
-./scripts/download_piper.sh
-
-# Download the default Piper voice into ./voices/
-./scripts/download_voice.sh
-
-# Configure (all optional — sane defaults otherwise)
-cp .env.example .env   # edit LLM_BASE_URL / LLM_MODEL to match your setup
+./scripts/first_run.sh                # CPU
+TORCH=cu128 ./scripts/first_run.sh    # NVIDIA GPU (RTX 50-series needs cu128); then set TTS_DEVICE=cuda in .env
 ```
 
-faster-whisper downloads its model automatically on first run.
+It's safe to re-run, and every step skips what's already done:
+
+1. creates `.venv` (Python 3.12) and installs `requirements.txt`
+2. creates `.env` from `.env.example` if there isn't one (set `LLM_BASE_URL` / `LLM_MODEL` there)
+3. checks for Rocky's voice reference in `rocky/`, and copies it from the Rocky voice project if it finds one
+   (`ROCKY_REPO=/path`, default `~/src/repos/rocky`)
+4. downloads the models into the Hugging Face cache: the Whisper model (`WHISPER_MODEL`) and Qwen3-TTS (`TTS_MODEL`,
+   ~2.4 GB). Then the first `/talk` doesn't stall on a download (`scripts/download_models.py`)
+5. checks that the LLM endpoint answers
+
+On a fresh machine that's ~1 GB of Python packages (several GB with CUDA torch) plus ~2.5 GB of models; mind
+metered connections. Offline check on a machine that already has everything:
+`UV_OFFLINE=1 HF_HUB_OFFLINE=1 ./scripts/first_run.sh`.
+
+## Voice reference (private, not in git)
+
+Rocky's voice is cloned from a reference clip **cut from the film's audio**, so it's personal-use material and never
+committed (`rocky/` and `*.wav` are gitignored). The API needs two files:
+
+| File | What it is |
+|---|---|
+| `rocky/rocky_ref.wav` | ~10-30 s of clean speech in the target voice: mono, 16-bit PCM WAV (24 kHz is ideal), no music. Several short lines joined with ~0.2 s gaps are fine. |
+| `rocky/rocky_ref.txt` | The **exact** transcript of that audio on one line, in the same order. Qwen3-TTS aligns text to audio, so a wrong word here audibly hurts the clone. |
+
+Ways to get them:
+
+- **From the Rocky voice project** (how it was built: vocal separation, line picking, A/B tested by ear):
+  `./scripts/get_rocky_voice.sh /path/to/rocky`. It copies `voice/rocky_ref_golden.{wav,txt}`.
+- **Bring your own**: drop any clip + transcript pair in `rocky/` (or point `TTS_REF_AUDIO` / `TTS_REF_TEXT`
+  elsewhere). A different voice works the same way; adjust `SYSTEM_PROMPT` to match the character.
+
+Only use voices you have the right to use, and don't publish clips or outputs cloned from them.
+
+## Private settings (not in git)
+
+| Where | What | How to set it up |
+|---|---|---|
+| `api/.env` | LLM endpoint/model, Whisper size, device, any `SYSTEM_PROMPT` override | `first_run.sh` copies `.env.example`; edit it |
+| `api/rocky/` | voice reference | see above |
+| ESP32 NVS | WiFi SSID/password and this server's URL (`http://<this machine's LAN IP>:8000/talk`) | the board's config portal, see [`firmware/README.md`](../firmware/README.md). The committed `sdkconfig` only has placeholders |
 
 ## Run
 
 ```bash
 # .env in the project root is picked up automatically
-.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+MALLOC_ARENA_MAX=2 .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-Bind to `0.0.0.0` so the ESP32 can reach it from the LAN.
+Bind to `0.0.0.0` so the ESP32 can reach it from the LAN. Startup loads Rocky's voice (~30 s on a CPU) before
+the first request, so `/talk` doesn't pay for it.
+
+## Run as a service
+
+```bash
+./scripts/install_service.sh --enable     # systemd user unit: starts at login, restarts on failure
+journalctl --user -u esp32-homeai-api -f  # logs
+```
+
+It writes `~/.config/systemd/user/esp32-homeai-api.service` for this checkout's path, with `MALLOC_ARENA_MAX=2`.
+Without `--enable` it only writes the unit.
+
+## Speed and memory
+
+- **CPU-only laptop** (tested on a Ryzen 7 4700U): Rocky takes ~60 s for one short sentence, so a full `/talk`
+  round trip is ~1-2 minutes. The firmware's `HTTP_TIMEOUT_MS` is 180 s to allow for that.
+- **NVIDIA GPU**: install the cu128 torch wheels (see `requirements.txt`) and set `TTS_DEVICE=cuda` (and
+  `WHISPER_DEVICE=cuda`, `WHISPER_COMPUTE_TYPE=float16`): a few seconds per answer.
+- **15 GB RAM laptop**: this process (~3 GB: Whisper small + Qwen3-TTS fp32) plus an Ollama model on the iGPU is tight.
+  llama3.2 at its default 12k context took ~3.6 GB and caused OOM kills. A 2k-context variant is plenty for short replies:
+
+  ```bash
+  printf 'FROM llama3.2\nPARAMETER num_ctx 2048\n' > Modelfile && ollama create llama3.2-2k -f Modelfile
+  # then LLM_MODEL=llama3.2-2k
+  ```
+
+  On a machine that small, also:
+  - `LLM_KEEP_ALIVE=0` (Ollama): unload the LLM right after each reply so its RAM is free while Rocky speaks.
+  - Start uvicorn as `MALLOC_ARENA_MAX=2 .venv/bin/uvicorn ...`: stops per-thread memory pools from growing.
+  - One `/talk` at a time: a request that arrives while the previous answer is still being made gets HTTP 503
+    right away (a stacked second Whisper + TTS run is what got the process OOM-killed).
+
+Every reply ends with a short fade and 0.5 s of silence. The firmware's I2S DMA keeps looping its last buffer after
+playback, so audio ending mid-sound would repeat as a "tatatata" until the board is reset.
+
+Tested end to end on 2026-10-19 (laptop, CPU, llama3.2-2k): "How long have you been together?" →
+"A long time. Many years." in Rocky's voice, HTTP 200 in 70 s.
 
 ## Test without an ESP32
 
@@ -84,25 +154,15 @@ This endpoint returns a real WAV file (header included, via `wave.open()` in `ap
 
 ## Configuration
 
-See `.env.example` for every knob (LLM endpoint/model, whisper size/device,
-Piper voice, output sample rate). A `.env` in the project root is loaded on
-startup; real environment variables still win over it.
+See `.env.example` for every knob (LLM endpoint/model, whisper size/device, Rocky's model/device/reference/
+temperature/language, output sample rate). A `.env` in the project root is loaded on startup; real environment
+variables still win over it. Inline `# comments` after unquoted values are ignored.
 
-### Another language
+### Notes
 
-Grab a matching Piper voice, then point `PIPER_MODEL` at it and pin
-`WHISPER_LANGUAGE` — auto-detect misfires on short clips, especially with the
-smaller whisper models. For Castilian Spanish:
-
-```bash
-NAME=es_ES-davefx-medium REL=es/es_ES/davefx/medium ./scripts/download_voice.sh
-```
-
-```ini
-WHISPER_MODEL=small
-WHISPER_LANGUAGE=es
-PIPER_MODEL=voices/es_ES-davefx-medium.onnx
-SYSTEM_PROMPT=Eres un asistente de voz. Responde siempre en español de España, en una o dos frases cortas y naturales.
-```
-
-Voice list: [rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices).
+- **Whisper decoding**: `app/stt.py` decodes PCM WAV itself and hands Whisper the samples. faster-whisper 1.2.1's own
+  PyAV path calls `av.open(..., metadata_errors=...)`, which PyAV 19 rejects, and av isn't pinned.
+- **Another language**: `TTS_LANGUAGE=Spanish` (and `WHISPER_LANGUAGE=es` plus a Spanish `SYSTEM_PROMPT`) makes Rocky
+  speak Spanish with the same voice. Untested: the voice was tuned by ear in English.
+- **Changing the voice**: it's tuned and A/B-tested by ear in `~/src/repos/rocky` (see its CLAUDE.md). Re-run
+  `scripts/get_rocky_voice.sh` after the reference changes there.
