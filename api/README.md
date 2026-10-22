@@ -1,14 +1,15 @@
 # ESP32 Voice Assistant API
 
 A small Python service that turns a voice clip into a spoken answer **in Rocky's voice** (the Eridian engineer from
-*Project Hail Mary*). Speech-to-text and text-to-speech run in this process; the only outside call is to whatever
-LLM endpoint you point it at.
+*Project Hail Mary*). Speech-to-text and text-to-speech run in this process, the LLM is whatever OpenAI-compatible
+endpoint you point it at, and the optional tools fetch weather, news and the like (see [Privacy](#privacy)).
 
 ```
 ESP32 (mic) --WAV--> POST /talk --> STT (faster-whisper)
-                                      -> LLM (your OpenAI-compatible endpoint)
+                                      -> LLM (your OpenAI-compatible endpoint) <-> tools (weather, news, timers...)
                                       -> TTS (Rocky: Qwen3-TTS voice clone)
 ESP32 (speaker) <--WAV-- response <----'
+ESP32 (idle) --GET /pending every 3 s--> due alarm/timer/reminder? -> Rocky's announcement as a WAV (else 204)
 ```
 
 ## Pipeline
@@ -19,6 +20,51 @@ ESP32 (speaker) <--WAV-- response <----'
 3. **TTS**: [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) 12Hz 0.6B Base clones Rocky's voice zero-shot from a
    reference clip plus its exact transcript, picked by ear in the Rocky voice project (`~/src/repos/rocky`). The reply is
    downsampled to a 16 kHz / 16-bit / mono WAV the ESP32 can play.
+
+## What Rocky can do
+
+Ask in plain words; the LLM picks the tool (`app/tools.py`). Short-term memory keeps the last 4 exchanges for
+5 minutes, so follow-ups work ("and tomorrow?", "tell me more about the first one").
+
+| Ask | Tool | Source / where it's kept |
+|---|---|---|
+| "What time is it?" | `get_time` | local clock, `HOME_TZ` |
+| "Do I need an umbrella tomorrow?" | `get_weather` | [Open-Meteo](https://open-meteo.com) (forecast + geocoding), default place `HOME_*` |
+| "Give me the news" (world / Spain / local) | `get_news` | RSS: BBC World; El País + 20minutos; `LOCAL_NEWS_FEEDS`. Told in plain English |
+| "Seconds in a week?" | `calculate` | safe arithmetic evaluator (no `eval`) |
+| "Who was Ramón y Cajal?" | `lookup_wikipedia` | Wikipedia (en/es) |
+| "Set a timer for 10 minutes", "remind me to call mum at 19:30" | `set_timer`, `set_reminder`, `list_alerts`, `cancel_alert` | `STATE_DIR/alerts.json`; announced by the speaker via `/pending` |
+| "Wake me up at 7:30", "every weekday at 7" | `set_alarm` | same; rings with the morning briefing, composed ~2 min ahead |
+| "Add milk to the list", "clear the list", "undo" | shopping-list tools | `STATE_DIR/shopping.json` |
+| "Good morning!" | `get_morning_briefing` | weather + today's reminders + 2 news + shopping list size |
+| "What song is this?" | `identify_song` | Shazam (unofficial, see below); the speaker's follow-up window records the music |
+| "Send me the list / that recipe", "remind me **on my phone**" | `send_shopping_list`, `send_to_phone` | Telegram bot, one-way to `TELEGRAM_CHAT_ID` only |
+| "How's my homelab?" | `get_homelab_status` | Kubernetes API + DCGM exporter (only when deployed in a cluster) |
+
+**Honesty check.** With ~20 tools the model sometimes says "alarm set" without calling anything. `app/llm.py`
+catches an action request ("wake me", "add", "cancel", "send"...) that ended without a tool call, nudges the model
+once, and if it still claims success replies "Rocky could not do that" instead. Recognized songs also go to Telegram
+when it's set up.
+
+## Privacy
+
+What leaves this machine, and only when a question needs it:
+
+| Service | What it gets | When |
+|---|---|---|
+| Your LLM endpoint | the transcript, recent conversation, tool results | every question |
+| Open-Meteo | coordinates of home or the place asked about | weather questions |
+| RSS feeds (BBC, El País, 20minutos, `LOCAL_NEWS_FEEDS`) | a plain feed request | news questions |
+| Wikipedia | the topic | fact look-ups |
+| Shazam (via [shazamio](https://github.com/shazamio/ShazamIO), unofficial) | a fingerprint of ~10 s of the music recording | "what song is this?" |
+| Telegram | the message text, to your chat only | "send it to my phone", phone reminders, recognized songs |
+
+Never sent anywhere: the voice reference, your recordings (except the music clip's fingerprint), the bot token (not
+logged: errors are scrubbed). The Telegram bot is **one-way**: nothing reads messages sent to it. `TOOLS_ENABLED=false`
+turns all outside calls off but the LLM's.
+
+shazamio is a reverse-engineered client of Shazam's API (no key): it can break whenever Shazam changes something, and
+using it is against Shazam's terms. Rocky then just says he can't recognize songs right now.
 
 ## Setup
 
@@ -67,9 +113,18 @@ Only use voices you have the right to use, and don't publish clips or outputs cl
 
 | Where | What | How to set it up |
 |---|---|---|
-| `api/.env` | LLM endpoint/model, Whisper size, device, any `SYSTEM_PROMPT` override | `first_run.sh` copies `.env.example`; edit it |
+| `api/.env` | LLM endpoint/model, Whisper size, device, home location, Telegram token + chat id, any `SYSTEM_PROMPT` override | `first_run.sh` copies `.env.example`; edit it |
+| `api/state/` | timers, alarms, reminders, shopping list | created on first use (`STATE_DIR`) |
 | `api/rocky/` | voice reference | see above |
 | ESP32 NVS | WiFi SSID/password and this server's URL (`http://<this machine's LAN IP>:8000/talk`) | the board's config portal, see [`firmware/README.md`](../firmware/README.md). The committed `sdkconfig` only has placeholders |
+
+### Telegram (optional)
+
+1. In Telegram, talk to **@BotFather**: `/newbot`, pick a name; it gives you the bot token.
+2. Open your new bot's chat and press **Start**.
+3. Find your chat id (in your own terminal, so the token doesn't end up anywhere else):
+   `curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates" | grep -o '"chat":{"id":[0-9-]*'`
+4. Put both in `.env` (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`) and restart.
 
 ## Run
 
@@ -126,6 +181,9 @@ docker run -d --gpus 1 -p 8000:8000 \
   instead of 4-9 s per reply on qwen3.8-27b, with the same answers on short voice questions.
 - **Image size**: CPU ~2 GB; CUDA several GB (the torch wheels bundle CUDA + cuDNN, which faster-whisper reuses via
   `LD_LIBRARY_PATH`).
+- **Thin GPU image** (`Dockerfile.thin`): this repo's `app/` plus the newer deps (faster-qwen3-tts, transformers 5,
+  shazamio) as one ~75 MB layer on top of a published full `:cuda` image, so a node that already has it doesn't pull
+  another ~12 GB: `docker build -f Dockerfile.thin -t <you>/esp32-homeai-api:cuda-tools .`
 - Runs as a non-root user, has a `/health` healthcheck, and sets `MALLOC_ARENA_MAX=2`.
 
 ## Speed and memory
@@ -133,7 +191,8 @@ docker run -d --gpus 1 -p 8000:8000 \
 - **CPU-only laptop** (tested on a Ryzen 7 4700U): Rocky takes ~60 s for one short sentence, so a full `/talk`
   round trip is ~1-2 minutes. The firmware's `HTTP_TIMEOUT_MS` is 180 s to allow for that.
 - **NVIDIA GPU**: install the cu128 torch wheels (see `requirements.txt`) and set `TTS_DEVICE=cuda` (and
-  `WHISPER_DEVICE=cuda`, `WHISPER_COMPUTE_TYPE=float16`): a few seconds per answer.
+  `WHISPER_DEVICE=cuda`, `WHISPER_COMPUTE_TYPE=float16`). With faster-qwen3-tts (`TTS_ENGINE=faster`, the default on a
+  GPU) speech is ~2.8x realtime on an RTX 5060 Ti: ~4-6 s per answer end to end, ~0.1 s of it Whisper.
 - **15 GB RAM laptop**: this process (~3 GB: Whisper small + Qwen3-TTS fp32) plus an Ollama model on the iGPU is tight.
   llama3.2 at its default 12k context took ~3.6 GB and caused OOM kills. A 2k-context variant is plenty for short replies:
 
@@ -181,18 +240,24 @@ Response: `audio/wav` body (the spoken reply). Debug headers:
 `X-Transcript` and `X-Reply` (URL-encoded). The server also logs the received
 content-type, byte count, and transcript for each request.
 
-`GET /health` — `{"status": "ok"}`.
+`GET /health` — `{"status": "ok", "counters": {"answered": N, "silence": N}}`; `GET /stats` — the counters alone.
+
+`GET /pending` — polled by the speaker while idle: `200` + WAV with Rocky's announcement when an alarm, timer or
+reminder is due, `204` otherwise (also `204` while a `/talk` is in progress).
+
+A `/talk` right after "what song is this?" is treated as a music sample: it goes to Shazam instead of Whisper
+(`X-Transcript: (music)`).
 
 ## ESP32 side
 
-The [`firmware/`](../firmware) folder in this repo implements the other end: records mono 16-bit 16 kHz PCM into a WAV, POSTs it as the raw request body (not multipart) to `http://<host>:8000/talk` on hearing the **"assistant"** voice command, and plays the response back. See [`firmware/README.md`](../firmware/README.md) for the board it targets and how to configure the URL.
+The [`firmware/`](../firmware) folder in this repo implements the other end: on **"Alexa"** or **"Hey Rocky"** it records mono 16-bit 16 kHz PCM into a WAV, POSTs it as the raw request body (not multipart) to `http://<host>:8000/talk`, plays the response back, and keeps listening ~6 s for a follow-up; while idle it polls `/pending` for announcements. See [`firmware/README.md`](../firmware/README.md) for the board it targets and how to configure the URL.
 
 This endpoint returns a real WAV file (header included, via `wave.open()` in `app/tts.py`), not headerless raw PCM. The firmware handles this on its end — `find_pcm_payload()` in `voice_assistant.c` locates the actual `data` sub-chunk before playback instead of assuming either a fixed offset or a headerless body — so nothing needs to change here.
 
 ## Configuration
 
-See `.env.example` for every knob (LLM endpoint/model, whisper size/device, Rocky's model/device/reference/
-temperature/language, output sample rate). A `.env` in the project root is loaded on startup; real environment
+See `.env.example` for every knob (LLM endpoint/model, whisper size/device/hint words, Rocky's model/device/engine/
+reference/temperature/language, output sample rate, silence gate, memory, tools, home location, Telegram). A `.env` in the project root is loaded on startup; real environment
 variables still win over it. Inline `# comments` after unquoted values are ignored.
 
 ### Notes
@@ -200,6 +265,7 @@ variables still win over it. Inline `# comments` after unquoted values are ignor
 - **Whisper decoding**: `app/stt.py` decodes PCM WAV itself and hands Whisper the samples. faster-whisper 1.2.1's own
   PyAV path calls `av.open(..., metadata_errors=...)`, which PyAV 19 rejects, and av isn't pinned.
 - **Another language**: `TTS_LANGUAGE=Spanish` (and `WHISPER_LANGUAGE=es` plus a Spanish `SYSTEM_PROMPT`) makes Rocky
-  speak Spanish with the same voice. Untested: the voice was tuned by ear in English.
+  speak Spanish with the same voice. Tried: it works, but cloned from the English reference he has a strong English
+  accent. A reference clip in the target language would fix that.
 - **Changing the voice**: it's tuned and A/B-tested by ear in `~/src/repos/rocky` (see its CLAUDE.md). Re-run
   `scripts/get_rocky_voice.sh` after the reference changes there.

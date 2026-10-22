@@ -57,11 +57,17 @@ idf.py -p /dev/ttyACM0 flash monitor
 
 On boot the device initializes I2C, both audio codecs, the button expander, the LED ring, loads the wake-word model from the `model` partition, starts the debounced button scan, connects to WiFi (waits up to 15s, then keeps retrying in the background if it fails), and starts listening.
 
-**The single-wake assistant flow.** Say **"Alexa"** — one utterance, that's the whole trigger. There is no second "assistant" command and no set of local voice commands; the wake word goes straight to the network round trip. On a verified wake, `main.c`'s `Speech_event_callback` (`ESP_SR_EVT_AWAKEN` case) calls `voice_assistant_ask()`, which:
+**The single-wake assistant flow.** Say **"Alexa"** or **"Hey Rocky"** — one utterance, that's the whole trigger. There is no second "assistant" command and no set of local voice commands; the wake word goes straight to the network round trip.
+
+- **"Alexa"** is esp-sr's WakeNet9 (`wn9_alexa`, threshold 0.5 in `mic_speech.c`).
+- **"Hey Rocky"** has no WakeNet model, so it runs on **MultiNet7 English** (`mn7_en`) as a speech command given as plain text, listening continuously in back-to-back 6 s windows on the same AFE output (plus the variants "hey roki" and "hi rocky" for a Spanish accent). It's less robust than "Alexa"; every hit is logged with its probability (`MultiNet heard ...`) for tuning. Running MultiNet non-stop needs esp-sr's recommended clocks, set in the committed `sdkconfig`: **240 MHz CPU, 80 MHz PSRAM, 64 KB data cache with 64-byte lines, 32 KB instruction cache**. At 160 MHz / 40 MHz the AFE ring buffer overflows and the idle-task watchdog fires. On a verified wake, `main.c`'s `Speech_event_callback` (`ESP_SR_EVT_AWAKEN` case) calls `voice_assistant_ask()`, which:
 
 1. **Records the question with VAD** (`audio_capture_vad()` in `audio_echo.c`). It captures from the mic until the user stops talking (a run of low-RMS trailing silence, `VAD_SILENCE_MS`) or a hard cap elapses (`VAD_MAX_SECONDS`), whichever comes first. The length is variable — a short "what time is it?" yields a short recording. It always returns some audio, even pure silence; deciding that a recording is "nothing was said" is deliberately left to the API's silence gate (see "Voice assistant setup"). The two VAD thresholds are room-specific and were dialed in on this board — see [VAD capture](#vad-capture-dialed-to-the-room-fixed) at the bottom.
 2. Wraps the mono PCM in a 44-byte WAV header and POSTs it to the configured endpoint URL.
-3. Reads the response and plays it back on the speaker.
+3. Reads the response and plays it back on the speaker, in 256 ms stereo chunks (a stereo copy of a whole long reply no longer fits in PSRAM next to MultiNet7).
+4. **Follow-up mode**: after an answer the mic stays open for 6 s (ring magenta again), so you can keep talking without the wake word; the API keeps the conversation's context. Silence in that window, or an answer that's just the API's ~0.4 s "nothing heard" clip, ends it. Up to 5 follow-ups per wake (`FOLLOWUP_*` in `voice_assistant.c`).
+
+**Announcements (alarms, timers, reminders).** The speaker can't be called, so while idle a task polls the API's `GET /pending` (the `/talk` URL with `/talk` swapped for `/pending`) every 3 s and plays whatever comes back (ring green); `204` means nothing is due. A shared lock keeps an announcement and a question from ever overlapping.
 
 If WiFi isn't connected, it flashes the ring red twice and does nothing else — there's nothing to send the recording to. The whole round trip runs synchronously on `detect_Task`'s thread, with the mic's `feed_Task` paused for the duration, so wake-word detection is suspended until the response has finished playing.
 
@@ -80,11 +86,12 @@ If WiFi isn't connected, it flashes the ring red twice and does nothing else —
 
 | Ring state | Meaning |
 |---|---|
-| Off | Idle, waiting for "Alexa" |
-| Solid magenta | VAD-recording the question |
+| Off | Idle, waiting for "Alexa" / "Hey Rocky" |
+| Solid magenta | VAD-recording the question (or listening for a follow-up) |
 | Solid yellow | Uploading / waiting for the assistant's response |
 | Solid blue | Playing back the response |
-| Red flash x2, then off | Assistant failed (no WiFi, or capture/upload error) |
+| Solid green | Playing an alarm / timer / reminder announcement |
+| Red flash x2, then off | Assistant failed (no WiFi, capture/upload error, or playback error) |
 | Quick green flash | Volume up (K2) |
 | Quick orange flash | Volume down (K3) |
 
@@ -141,7 +148,7 @@ if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
 ```
 
-Run it, point `VOICE_ASSISTANT_ENDPOINT_URL` at `http://<your-machine-ip>:8000/voice`, reflash, and say "Alexa" — you should hear a beep back a few seconds later. Once that works, swap the `TODO` for a real pipeline.
+Run it, point `VOICE_ASSISTANT_ENDPOINT_URL` at `http://<your-machine-ip>:8000/voice`, reflash, and say "Alexa" — you should hear a beep back a few seconds later. (Without a `/pending` endpoint the announcement poll just gets 404s and stays quiet.) Once that works, swap the `TODO` for a real pipeline.
 
 **How the server "waits" for STT -> LLM -> TTS:** there's no special mechanism needed — it's just three ordinary blocking calls, one after another, inside the same request handler. Flask (or any WSGI server) doesn't send anything back to the ESP until your handler function actually returns, so as long as each step's blocking call is chained before the `return`, the ESP's HTTP connection just stays open for the whole chain. Concretely, with OpenAI's APIs as an example (`pip install flask openai pydub`, plus `ffmpeg` installed for `pydub` to decode the TTS output):
 

@@ -13,8 +13,8 @@ ESP32 (speaker) <--WAV-- response <-----------------'
 
 | Folder | What it is |
 | --- | --- |
-| [`api/`](api/) | Python service that does the work: WAV in, STT (Whisper) → LLM (any OpenAI-compatible endpoint) → TTS (Rocky's voice, Qwen3-TTS), spoken WAV out. See [`api/README.md`](api/README.md). |
-| [`firmware/`](firmware/) | ESP-IDF firmware — wake word, local voice commands, records the clip, POSTs it, plays the reply. Includes a WiFi config portal for on-device setup. See [`firmware/README.md`](firmware/README.md). |
+| [`api/`](api/) | Python service that does the work: WAV in, STT (Whisper) → LLM (any OpenAI-compatible endpoint, with tools: weather, news, timers/alarms/reminders, shopping list, morning briefing, "what song is this?", Telegram...) → TTS (Rocky's voice, Qwen3-TTS), spoken WAV out. See [`api/README.md`](api/README.md). |
+| [`firmware/`](firmware/) | ESP-IDF firmware — wake words ("Alexa", "Hey Rocky"), records the question, POSTs it, plays the reply, keeps listening for follow-ups, and plays alarm/timer announcements. Includes a WiFi config portal for on-device setup. See [`firmware/README.md`](firmware/README.md). |
 
 ## Quick start
 
@@ -23,7 +23,13 @@ ESP32 (speaker) <--WAV-- response <-----------------'
    [`api/README.md`](api/README.md). Then `./scripts/install_service.sh --enable` keeps it running.
 2. **LLM**: any OpenAI-compatible endpoint (Ollama, vLLM, ...) set in `api/.env`.
 3. **Board**: build + flash [`firmware/`](firmware/), then set WiFi and `http://<server LAN IP>:8000/talk` in its
-   config portal. Say **"Alexa"**, then **"assistant"**, then your question.
+   config portal. Say **"Alexa"** or **"Hey Rocky"**, then your question; after the answer you can just keep talking
+   for ~6 s (follow-up mode).
+
+Optional: home location, Telegram ("send it to my phone") and the other tool settings are in
+[`api/.env.example`](api/.env.example); what leaves your network and when is listed in
+[`api/README.md` → Privacy](api/README.md#privacy). A Kubernetes deployment (GPU, llama.cpp) lives in the author's
+[homelab repo](https://github.com/lalotone/homelab/tree/main/k8s/esp32-homeai).
 
 ## Hardware
 
