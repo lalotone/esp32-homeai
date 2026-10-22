@@ -1,0 +1,11 @@
+# Trial image fooser/esp32-homeai-api:cuda-fast: faster-qwen3-tts on top of the :cuda image, as a thin (~58 MB) layer
+# so heavy1 does not need another ~12 GB. Built from the :cuda code + this tts.py/config.py:
+#   docker build -f Dockerfile.fast-trial -t fooser/esp32-homeai-api:cuda-fast .   (COPY app/ uses the working tree)
+# Once it sticks: fold requirements.txt into the main Dockerfile and rebuild once (torch in its own layer).
+FROM fooser/esp32-homeai-api@sha256:88a3d4212644ab49533735db3da015b87d294c37f159db3870bdd2cbf0117296
+USER root
+# Upstream qwen-tts first: qwen-tts-hf ships the same `qwen_tts` package, and uninstalling afterwards would delete it.
+RUN uv pip uninstall --system qwen-tts \
+ && uv pip install --system --no-cache "faster-qwen3-tts==0.5.4" "qwen-tts-hf==0.1.1.post1" "transformers==5.15.1" "torch==2.9.1" "torchaudio==2.9.1"
+COPY --chown=app app/ app/
+USER app

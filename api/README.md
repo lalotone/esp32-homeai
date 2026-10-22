@@ -106,11 +106,13 @@ or without compose:
 ```bash
 docker build -t esp32-homeai-api:cuda --build-arg TORCH=cu128 .
 docker run -d --gpus 1 -p 8000:8000 \
-  -v "$PWD/rocky:/app/rocky:ro" -v hf-cache:/cache/hf \
+  -v "$PWD/rocky:/app/rocky:ro,z" -v hf-cache:/cache/hf \
   -e TTS_DEVICE=cuda -e WHISPER_DEVICE=cuda -e WHISPER_COMPUTE_TYPE=float16 \
   -e LLM_BASE_URL=http://<llm-host>:11434/v1 esp32-homeai-api:cuda
 ```
 
+- **SELinux (Fedora/RHEL)**: bind mounts need `,z` (as in the examples), or the container sees "Permission denied" and
+  stops with "voice reference is missing".
 - **Nothing private is in the image.** The voice reference is a read-only bind mount (`./rocky` → `/app/rocky`), and
   `.dockerignore` only lets `requirements.txt`, `app/` and two scripts in. The container refuses to start
   without the reference and says how to provide it.
@@ -120,6 +122,8 @@ docker run -d --gpus 1 -p 8000:8000 \
 - **LLM address**: inside a container `localhost` is the container itself. Compose defaults to Ollama on the host
   (`host.docker.internal:11434`); set `DOCKER_LLM_BASE_URL` for anything else (e.g. `http://heavy1:30800/v1`).
   `.env` is shared with the native run for every other setting.
+- **LLM speed**: with a Qwen3 thinking model on vLLM, `LLM_ENABLE_THINKING=false` skips the reasoning step: ~1 s
+  instead of 4-9 s per reply on qwen3.8-27b, with the same answers on short voice questions.
 - **Image size**: CPU ~2 GB; CUDA several GB (the torch wheels bundle CUDA + cuDNN, which faster-whisper reuses via
   `LD_LIBRARY_PATH`).
 - Runs as a non-root user, has a `/health` healthcheck, and sets `MALLOC_ARENA_MAX=2`.

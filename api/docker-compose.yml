@@ -10,7 +10,8 @@ x-api: &api
   ports:
     - "8000:8000"
   volumes:
-    - ./rocky:/app/rocky:ro         # private voice reference, never baked into the image
+    # ,z: relabel for SELinux (Fedora/RHEL); without it the container gets "Permission denied". Ignored elsewhere.
+    - ./rocky:/app/rocky:ro,z       # private voice reference, never baked into the image
     - hf-cache:/cache/hf            # Whisper + Qwen3-TTS, downloaded on the first start
   env_file:
     - path: .env

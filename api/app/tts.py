@@ -14,6 +14,7 @@ The model speaks at 24 kHz; we downsample to `output_sample_rate` (16 kHz defaul
 emit 16-bit mono PCM.
 """
 import io
+import os
 import re
 import threading
 import wave
@@ -31,25 +32,51 @@ TAIL_SILENCE_S = 0.5    # see synthesize(): keeps the ESP32 from looping the las
 
 _model = None
 _prompt = None
+_ref_text = ""
+_fast = False           # True: faster-qwen3-tts (CUDA graphs); False: plain qwen_tts
 _lock = threading.Lock()  # the model isn't re-entrant
+
+
+def _use_fast() -> bool:
+    """faster-qwen3-tts on a GPU unless TTS_ENGINE=qwen. It captures the whole decode step in a CUDA graph:
+    ~2.8x realtime on an RTX 5060 Ti vs 0.72x for plain qwen_tts, which leaves the GPU idle ~75% of the time
+    between small kernels. It's GPU-only, so the CPU always uses qwen_tts."""
+    return settings.tts_device.startswith("cuda") and settings.tts_engine.lower() == "faster"
 
 
 def get_model():
     """Load the model and encode Rocky's voice prompt on first use."""
-    global _model, _prompt
+    global _model, _prompt, _ref_text, _fast
     with _lock:
         if _model is None:
-            from qwen_tts import Qwen3TTSModel
+            from huggingface_hub import snapshot_download
 
+            # Resolve a Hub id to its local snapshot first. Given a Hub id, transformers 4.57's tokenizer loader
+            # queries huggingface.co even with HF_HUB_OFFLINE=1 and fails; given a local folder it doesn't.
+            # snapshot_download honours offline mode (cache only) and downloads only if needed.
+            model_path = settings.tts_model if os.path.isdir(settings.tts_model) else snapshot_download(settings.tts_model)
             cuda = settings.tts_device.startswith("cuda")
-            _model = Qwen3TTSModel.from_pretrained(
-                settings.tts_model,
-                device_map=settings.tts_device,
-                dtype=torch.bfloat16 if cuda else torch.float32,
-            )
             with open(settings.tts_ref_text) as f:
-                ref_text = f.read().strip()
-            _prompt = _model.create_voice_clone_prompt(ref_audio=settings.tts_ref_audio, ref_text=ref_text)
+                _ref_text = f.read().strip()
+            _fast = _use_fast()
+            if _fast:
+                from faster_qwen3_tts import FasterQwen3TTS
+
+                _model = FasterQwen3TTS.from_pretrained(model_path, device=settings.tts_device, dtype=torch.bfloat16)
+                _model.warmup()  # capture the CUDA graphs now, not during the first /talk
+                _prompt = _model.model.create_voice_clone_prompt(ref_audio=settings.tts_ref_audio, ref_text=_ref_text)
+            else:
+                from qwen_tts import Qwen3TTSModel
+
+                _model = Qwen3TTSModel.from_pretrained(
+                    model_path,
+                    device_map=settings.tts_device,
+                    dtype=torch.bfloat16 if cuda else torch.float32,
+                )
+                _prompt = _model.create_voice_clone_prompt(ref_audio=settings.tts_ref_audio, ref_text=_ref_text)
+            # One throwaway line, so the first real answer doesn't pay for lazy CUDA/kernel setup.
+            with torch.inference_mode():
+                _generate("Rocky ready.")
     return _model
 
 
@@ -82,10 +109,12 @@ def _generate(chunk: str) -> np.ndarray:
     words = max(1, len(re.findall(r"[\w.']+", chunk)))
     budget_s = SECONDS_PER_WORD * words + 1.5
     temperature = settings.tts_temperature
+    # faster-qwen3-tts pads the reference with 0.5 s of silence by default; upstream (what the voice was tuned on) doesn't.
+    extra = {"ref_text": _ref_text, "append_silence": False} if _fast else {}
     for _ in range(2):
         wavs, _sr = _model.generate_voice_clone(
             text=chunk, language=settings.tts_language, voice_clone_prompt=_prompt,
-            max_new_tokens=int(TOKENS_PER_S * budget_s), temperature=temperature,
+            max_new_tokens=int(TOKENS_PER_S * budget_s), temperature=temperature, **extra,
         )
         audio = np.asarray(wavs[0], np.float32)
         if audio.size / MODEL_RATE < budget_s - 0.25:

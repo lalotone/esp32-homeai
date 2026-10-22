@@ -49,6 +49,13 @@ def get_model() -> WhisperModel:
     return _model
 
 
+def warmup() -> None:
+    """One throwaway pass at startup: the first CUDA transcription is ~10 s slower than the rest."""
+    noise = (np.random.default_rng(0).standard_normal(WHISPER_RATE) * 0.01).astype(np.float32)
+    segments, _info = get_model().transcribe(noise, language=settings.whisper_language or None, vad_filter=False)
+    list(segments)  # transcribe() is lazy: consuming the segments runs it
+
+
 def transcribe(wav_path: str) -> str:
     """Return the recognized text for a WAV file (any rate; whisper resamples)."""
     model = get_model()
@@ -57,5 +64,7 @@ def transcribe(wav_path: str) -> str:
         wav_path if audio is None else audio,
         language=settings.whisper_language or None,
         vad_filter=True,  # drop silence/noise so empty recordings don't hallucinate
+        # Names it should expect: an English Whisper otherwise mishears local names ("Zaragoza" as "Maragona").
+        initial_prompt=settings.whisper_prompt or None,
     )
     return " ".join(seg.text.strip() for seg in segments).strip()

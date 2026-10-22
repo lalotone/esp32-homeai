@@ -59,8 +59,26 @@ class Settings:
         "instead of \"I\". Triple words for emphasis (\"Good, good, good!\", \"Bad, bad, bad.\"). Love exact "
         "numbers. Warm, loyal, curious. Add the spoken word \"question\" ONLY at the end of a question YOU ask "
         "the user (\"You want recipe, question?\"). Never put \"question\" after a statement or an answer. Do not"
-        " talk about Erid, Grace, space or the movie unless the user asks. If you cannot know something (live"
-        " weather, news, the time) or cannot do it (timers, lights, music), say so simply. Never pretend or "
+        " talk about Erid, Grace, space or the movie unless the user asks. You have tools: use them instead of"
+        " guessing for the time and date, the weather (home is in Spain), the news (world, Spain, local), any"
+        " math, and facts you are not sure about. For the news, drop the Rocky grammar: use plain, simple, correct"
+        " English with short common words, so someone who is not a native speaker follows easily. Tell the 2 most"
+        " interesting stories like a friend catching the user up, one short clear sentence each: what happened,"
+        " where, and why it matters. Say who people are, not just names (\"Spain's former prime minister\"), and"
+        " avoid jargon and acronyms. Do NOT number them (no \"first\", \"one, two\", \"two things\"). Skip grim"
+        " details. Then one short Rocky-style reaction. Under 50 words in total. Spanish news is told in English. If a tool"
+        " fails, say Rocky cannot find out"
+        " now. You can set timers and reminders (the speaker announces them when due) ONLY by calling set_timer or"
+        " set_reminder: never say one is set, listed or cancelled unless that tool just succeeded in this turn."
+        " Confirm in a few words with the time. The shopping list works the same way: add, remove, read or clear it"
+        " ONLY through its tools, and never claim a change the tool didn't make; when reading it, list the items"
+        " plainly. For \"good morning\" or \"what's my day\", call get_morning_briefing and give a warm,"
+        " short briefing: greeting, weather, any reminders today, then the news in plain English, and how many"
+        " things are on the shopping list if any. Under 70 words. You can send messages to the user's phone"
+        " (send_to_phone, send_shopping_list, or set_reminder with to_phone): only when asked, and say it's sent"
+        " only if the tool succeeded. For the homelab (the user's home Kubernetes cluster), say in plain words if all is fine"
+        " and mention only real problems, GPU temperatures and free disk. You cannot do lights or music: say so"
+        " simply. Never pretend or "
         "promise to do things you cannot do. Reply ONLY with the words to speak aloud: no stage directions, "
         "no emoji, no markdown, no lists. Keep it to 1-3 short sentences.",
     )
@@ -68,6 +86,31 @@ class Settings:
     # Ollama only: how long the model stays loaded after a reply ("0" = unload right away,
     # freeing its RAM before Rocky's voice runs). Empty = don't send it (server default).
     llm_keep_alive: str = _get("LLM_KEEP_ALIVE", "")
+    # Qwen3-style thinking models on vLLM: "false" skips the reasoning step (~1 s instead of 4-9 s per reply on
+    # qwen3.8-27b, same answers for short voice questions). Empty = don't send it (model/template default).
+    llm_enable_thinking: str = _get("LLM_ENABLE_THINKING", "")
+    # Tools (app/tools.py): time, weather, news, math, Wikipedia. Needs internet from the API's host/pod.
+    tools_enabled: bool = _get("TOOLS_ENABLED", "true").lower() == "true"
+    # Home for the weather/time tools: the default place and timezone (e.g. HOME_NAME=Madrid).
+    home_name: str = _get("HOME_NAME", "Madrid")
+    home_lat: float = float(_get("HOME_LAT", "40.4168"))
+    home_lon: float = float(_get("HOME_LON", "-3.7038"))
+    home_tz: str = _get("HOME_TZ", "Europe/Madrid")
+    # The news tool's "local" region: comma-separated RSS URLs, and what to call them. Empty = no local news.
+    local_news_feeds: str = _get("LOCAL_NEWS_FEEDS", "")
+    local_news_name: str = _get("LOCAL_NEWS_NAME", "")
+    # Short-term memory, so follow-ups work ("and tomorrow?", "yes, tell me more"): the last few exchanges,
+    # forgotten after a quiet spell. 0 turns = every question stands alone.
+    history_turns: int = int(_get("HISTORY_TURNS", "4"))
+    history_ttl_s: float = float(_get("HISTORY_TTL_S", "300"))
+    # Timers/reminders file (alerts.json). Mount it on persistent storage to survive restarts.
+    state_dir: str = _get("STATE_DIR", "state")
+    # Homelab status tool: DCGM exporter metrics URL (GPUs) and a path on the GPU node's disk. Empty = skip.
+    homelab_dcgm_url: str = _get("HOMELAB_DCGM_URL", "")
+    homelab_disk_path: str = _get("HOMELAB_DISK_PATH", "")
+    # Telegram bot for "send it to my phone": the bot's token and the user's own chat id (the only recipient).
+    telegram_bot_token: str = _get("TELEGRAM_BOT_TOKEN", "")
+    telegram_chat_id: str = _get("TELEGRAM_CHAT_ID", "")
 
     # --- STT (faster-whisper) ---
     whisper_model: str = _get("WHISPER_MODEL", "base")
@@ -75,11 +118,15 @@ class Settings:
     whisper_compute_type: str = _get("WHISPER_COMPUTE_TYPE", "int8")
     # Force a language (e.g. "en") or leave empty to auto-detect.
     whisper_language: str = _get("WHISPER_LANGUAGE", "")
+    # Words Whisper should expect (initial_prompt), e.g. local place names. Empty = none.
+    whisper_prompt: str = _get("WHISPER_PROMPT", "")
 
     # --- TTS (Rocky's voice: Qwen3-TTS Base, zero-shot clone) ---
     # Hugging Face id or local path of the Qwen3-TTS Base model.
     tts_model: str = _get("TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-Base")
     tts_device: str = _get("TTS_DEVICE", "cpu")  # or: cuda (bf16)
+    # GPU engine: "faster" (default, faster-qwen3-tts with CUDA graphs) or "qwen" (plain qwen_tts). CPU: always qwen.
+    tts_engine: str = _get("TTS_ENGINE", "faster")
     # The voice is cloned from this clip + its exact transcript (scripts/get_rocky_voice.sh).
     tts_ref_audio: str = _get("TTS_REF_AUDIO", "rocky/rocky_ref.wav")
     tts_ref_text: str = _get("TTS_REF_TEXT", "rocky/rocky_ref.txt")
@@ -90,6 +137,15 @@ class Settings:
     # --- Output audio, shaped for the ESP32 I2S DAC (e.g. MAX98357A) ---
     # 16 kHz / 16-bit / mono is a safe default for small ESP32 speakers.
     output_sample_rate: int = int(_get("OUTPUT_SAMPLE_RATE", "16000"))
+
+    # --- Input silence gate ---
+    # A wake can be followed by nothing (the user said "Alexa" but no question). The
+    # firmware still uploads the recording; the API measures its RMS and, if it is
+    # below this level (dBFS, 0 dBFS = full scale), skips the STT/LLM/TTS pipeline,
+    # counts it, and returns a short silent reply. Lower = stricter.
+    silence_threshold_dbfs: float = float(_get("SILENCE_THRESHOLD_DBFS", "-40"))
+    # Length in seconds of the silent "nothing heard" reply the ESP32 plays back.
+    silence_reply_seconds: float = float(_get("SILENCE_REPLY_SECONDS", "0.4"))
 
 
 settings = Settings()
