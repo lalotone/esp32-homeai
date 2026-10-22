@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-from . import alerts, shopping, songs, telegram
+from . import alerts, photos, shopping, songs, telegram
 from .config import settings
 
 logger = logging.getLogger("uvicorn.error")
@@ -367,6 +367,28 @@ async def identify_song(client: httpx.AsyncClient) -> dict:
     return {"listening": True, "next": "the next recording is the music sample; tell the user to keep it playing"}
 
 
+# --- the last photo sent to the Telegram bot (photos.py) ---
+
+async def look_at_last_photo(client: httpx.AsyncClient, question: str = "") -> dict:
+    """Answer about the photo the user sent in the last 10 minutes. llm.py turns tools off for the rest of the turn
+    once this runs, and keeps the answer out of the conversation memory: text in a photo must not drive actions."""
+    p = photos.last_photo()
+    if not p:
+        raise LookupError("no photo in the last 10 minutes; the user can send one to the Telegram bot")
+    answer = await photos.look(p["jpeg"], question) if question else p["answer"]
+    return {"about_the_photo": answer, "their_caption": p["caption"]}
+
+
+async def add_photo_item_to_shopping_list(client: httpx.AsyncClient) -> dict:
+    """The main item of the LATEST photo onto the shopping list (named by the vision model, sanitized to a few plain
+    words). A photo tool too: llm.py turns tools off after it and keeps its result out of memory."""
+    p = photos.last_photo()
+    if not p:
+        raise LookupError("no photo in the last 10 minutes; the user can send one to the Telegram bot")
+    name = await photos.item_name(p["jpeg"])
+    return {"item": name, **shopping.add([name])}
+
+
 # --- good-morning briefing ---
 
 async def get_morning_briefing(client: httpx.AsyncClient) -> dict:
@@ -444,6 +466,14 @@ TOOLS = {
                                                    "time, today's weather, today's reminders, 2 world news, "
                                                    "shopping list size. Use it instead of the separate tools.", {}),
 }
+if settings.telegram_photos:
+    TOOLS["look_at_last_photo"] = (look_at_last_photo, "Look at the LATEST photo the user sent to the Telegram bot "
+                                   "(\"what's in the photo I sent?\"). The only way to know what's in it: photos change, "
+                                   "so never answer from earlier in the conversation.", {
+        "question": {"type": "string", "description": "What they want to know; omit to just describe it"}})
+    TOOLS["add_photo_item_to_shopping_list"] = (add_photo_item_to_shopping_list, "Put the item shown in the LATEST photo "
+                                                "on the shopping list (\"add the thing in the photo to the list\"). It "
+                                                "looks at the photo itself: never guess the item.", {})
 _REQUIRED = {"calculate": ["expression"], "lookup_wikipedia": ["topic"], "set_reminder": ["text"], "set_alarm": ["at"],
              "add_to_shopping_list": ["items"], "remove_from_shopping_list": ["items"], "send_to_phone": ["text"]}
 

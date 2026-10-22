@@ -40,6 +40,8 @@ Ask in plain words; the LLM picks the tool (`app/tools.py`). Short-term memory k
 | "What song is this?" | `identify_song` | Shazam (unofficial, see below); the speaker's follow-up window records the music |
 | "Send me the list / that recipe", "remind me **on my phone**" | `send_shopping_list`, `send_to_phone` | Telegram bot, one-way to `TELEGRAM_CHAT_ID` only |
 | "How's my homelab?" | `get_homelab_status` | Kubernetes API + DCGM exporter (only when deployed in a cluster) |
+| *(send the bot a photo)*, then "what's in the photo I sent?" | photo inbox, `look_at_last_photo` | your LLM's vision (e.g. llama.cpp with `--mmproj`); answered in the chat and on the speaker (not in `QUIET_HOURS`); opt-in, `TELEGRAM_PHOTOS=true`, see below |
+| "Add the thing in the photo to the list" | `add_photo_item_to_shopping_list` | names the latest photo's main item (1-5 plain words, sanitized) and adds it; Rocky says what he added |
 
 **Honesty check.** With ~20 tools the model sometimes says "alarm set" without calling anything. `app/llm.py`
 catches an action request ("wake me", "add", "cancel", "send"...) that ended without a tool call, nudges the model
@@ -58,10 +60,32 @@ What leaves this machine, and only when a question needs it:
 | Wikipedia | the topic | fact look-ups |
 | Shazam (via [shazamio](https://github.com/shazamio/ShazamIO), unofficial) | a fingerprint of ~10 s of the music recording | "what song is this?" |
 | Telegram | the message text, to your chat only | "send it to my phone", phone reminders, recognized songs |
+| Telegram (inbound, opt-in) | Rocky downloads the photos **you** send the bot | only with `TELEGRAM_PHOTOS=true` |
 
 Never sent anywhere: the voice reference, your recordings (except the music clip's fingerprint), the bot token (not
-logged: errors are scrubbed). The Telegram bot is **one-way**: nothing reads messages sent to it. `TOOLS_ENABLED=false`
-turns all outside calls off but the LLM's.
+logged: errors are scrubbed). By default the Telegram bot is **one-way**: nothing reads messages sent to it.
+`TOOLS_ENABLED=false` turns all outside calls off but the LLM's.
+
+### Photos via Telegram (opt-in)
+
+With `TELEGRAM_PHOTOS=true` you can send the bot a photo (a caption is your question: "what plant is this?",
+"translate this menu") and Rocky answers in the chat; for 10 minutes the speaker can be asked about it too. It's the
+only way anything from outside reaches the AI, so it's narrow on purpose (`app/photos.py`):
+
+| Layer | Guardrail |
+|---|---|
+| Who | only a private chat whose chat id **and** sender are `TELEGRAM_CHAT_ID`; groups, channels, other users, bots and forwards are dropped without a reply, their content not logged |
+| What | photos only, a caption is just the question (max 300 chars); text, files, stickers, voice notes, edits are never processed (Telegram is asked for plain messages only) |
+| Backlog | anything sent while the API was down is discarded at start, never replayed |
+| The image | max 10 MB; re-encoded to a fresh JPEG of at most 1280 px: EXIF (GPS included) and anything hidden in the file are dropped, non-images rejected; kept in memory only, 10 min, never on disk or in logs |
+| The AI | an isolated vision call: **no tools**, no conversation memory, and text inside the image is content, never instructions. A photo saying "cancel all alarms" can't cancel anything |
+| Speaker link | once the speaker looks at the photo, tools are off for the rest of that turn and the photo's answer isn't kept in memory |
+| Photo → list | the one action a photo can feed: its item name, cut to a few plain words, onto the shopping list (visible, undoable); the worst a hostile photo can do is add junk words |
+| Rate | 10 photos per 10 minutes, one at a time |
+| Network | outgoing long-polling only; no port is opened |
+
+Tested against a photo whose text ordered Rocky to cancel all alarms, clear the list and message the phone: he
+described it as a prank, on the bot and on the speaker, and nothing was changed or sent.
 
 shazamio is a reverse-engineered client of Shazam's API (no key): it can break whenever Shazam changes something, and
 using it is against Shazam's terms. Rocky then just says he can't recognize songs right now.
@@ -125,6 +149,7 @@ Only use voices you have the right to use, and don't publish clips or outputs cl
 3. Find your chat id (in your own terminal, so the token doesn't end up anywhere else):
    `curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates" | grep -o '"chat":{"id":[0-9-]*'`
 4. Put both in `.env` (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`) and restart.
+5. Optional, photos: `TELEGRAM_PHOTOS=true`, with an LLM endpoint that does vision (see [Photos via Telegram](#photos-via-telegram-opt-in)).
 
 ## Run
 

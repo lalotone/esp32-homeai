@@ -27,7 +27,7 @@ from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 from starlette.concurrency import run_in_threadpool
 
-from . import alerts, llm, songs, stt, telegram, tools, tts
+from . import alerts, announce, llm, photos, songs, stt, telegram, tools, tts
 from .config import settings
 
 logger = logging.getLogger("uvicorn.error")
@@ -96,6 +96,8 @@ async def _phone_loop() -> None:
 async def start_phone_loop() -> None:
     if telegram.configured():
         asyncio.get_running_loop().create_task(_phone_loop())
+    if photos.enabled():
+        asyncio.get_running_loop().create_task(photos.inbox_loop())
 
 
 # Wake-up alarms ring with the morning briefing. Composing it (tools + LLM + TTS of ~80 words) takes ~15 s, as long
@@ -145,6 +147,11 @@ async def pending() -> Response:
         return Response(status_code=204)  # busy answering a question: the next poll gets it
     async with _busy:
         await _send_phone_reminders()  # due phone reminders go out now too, before the speaker drops them
+        queued = announce.pop()  # ready-made speech (e.g. a photo's answer)
+        if queued:
+            text, wav_bytes = queued
+            logger.info("announcing: %r", text)
+            return Response(content=wav_bytes, media_type="audio/wav", headers={"X-Reply": quote(text)})
         alert = alerts.pop_due()
         if alert is None:
             return Response(status_code=204)

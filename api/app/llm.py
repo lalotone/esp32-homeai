@@ -33,6 +33,7 @@ _CLAIM = re.compile(r"\b(set|added|sent|cancel+ed|removed|cleared|done|ready|on 
 _NUDGE = ("[Check: you called no tool, so nothing was set, added, sent or cancelled. If this request needs a tool, "
           "call it now. If you really must ask the user something first, reply with only that question.]")
 _DIDNT_WORK = "Hmm, Rocky could not do that. Say it again, question?"
+PHOTO_TOOLS = {"look_at_last_photo", "add_photo_item_to_shopping_list"}  # their results come from a photo
 
 # Recent exchanges as (time, messages of that turn). One speaker, one conversation, so module state is enough.
 # The turn's tool calls and (trimmed) results are kept too: with only the final answers in the history, the model
@@ -115,6 +116,11 @@ async def _chat(user_text: str, from_user: bool = True) -> tuple[str, list[dict]
                                              for c in calls))
             step += [{"role": "tool", "tool_call_id": c.get("id", ""), "content": r} for c, r in zip(calls, results)]
             messages.extend(step)
+            if any(c["function"]["name"] in PHOTO_TOOLS for c in calls):
+                # A photo's content came from outside: from here on this turn can only talk, not act, and what the
+                # photo said isn't kept for later turns (which have tools).
+                payload.pop("tools", None)
+                step = [dict(m, content="(photo answer not kept)") if m["role"] == "tool" else m for m in step]
             turn.extend(step)
 
     return "", turn

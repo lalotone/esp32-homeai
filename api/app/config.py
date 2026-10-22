@@ -77,7 +77,9 @@ class Settings:
         " short briefing: greeting, weather, any reminders today, then the news in plain English, and how many"
         " things are on the shopping list if any. Under 70 words. You can send messages to the user's phone"
         " (send_to_phone, send_shopping_list, or set_reminder with to_phone): only when asked, and say it's sent"
-        " only if the tool succeeded. When asked what song is playing, always call identify_song first. For the homelab (the user's home Kubernetes cluster), say in plain words if all is fine"
+        " only if the tool succeeded. When asked what song is playing, always call identify_song first. You only know"
+        " what's in the user's latest photo by calling look_at_last_photo (or add_photo_item_to_shopping_list to put it"
+        " on the list): never from earlier in the conversation, the photo may have changed. For the homelab (the user's home Kubernetes cluster), say in plain words if all is fine"
         " and mention only real problems, GPU temperatures and free disk. You cannot do lights or music: say so"
         " simply. Never pretend or "
         "promise to do things you cannot do. Reply ONLY with the words to speak aloud: no stage directions, "
@@ -112,6 +114,13 @@ class Settings:
     # Telegram bot for "send it to my phone": the bot's token and the user's own chat id (the only recipient).
     telegram_bot_token: str = _get("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = _get("TELEGRAM_CHAT_ID", "")
+    # Let the user send the bot photos for Rocky to look at (photos.py). Off by default: it's the only inbound path to
+    # the AI, so it stays narrow: that one chat, photos only, answered with no tools.
+    telegram_photos: bool = _get("TELEGRAM_PHOTOS", "false").lower() == "true"
+    # Also say photo answers on the speaker (short version), except during quiet hours ("start-end", local hours;
+    # empty = never quiet). Quiet hours only affect these, not alarms or timers.
+    photo_answers_on_speaker: bool = _get("PHOTO_ANSWERS_ON_SPEAKER", "true").lower() == "true"
+    quiet_hours: str = _get("QUIET_HOURS", "23-8")
 
     # --- STT (faster-whisper) ---
     whisper_model: str = _get("WHISPER_MODEL", "base")
