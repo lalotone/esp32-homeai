@@ -100,6 +100,7 @@ async def get_weather(client: httpx.AsyncClient, location: str | None = None, da
     daily = d["daily"]
     i = days_ahead
     out = {"place": name, "units": "Celsius, km/h, mm",
+           "local_time_now": datetime.now(_tz()).strftime("%a %H:%M"),  # so "sunset 19:24" isn't "soon" at midnight
            "day": daily["time"][i],
            "conditions": WMO.get(daily["weather_code"][i], "unknown"),
            "max_c": daily["temperature_2m_max"][i], "min_c": daily["temperature_2m_min"][i],
@@ -293,7 +294,9 @@ async def set_timer(client: httpx.AsyncClient, minutes: float = 0, seconds: int 
 
 
 async def set_reminder(client: httpx.AsyncClient, text: str, at: str = "", day_offset: int = 0,
-                       in_minutes: float = 0, to_phone: bool = False) -> dict:
+                       in_minutes: float = 0, to_phone: bool = False, day: str = "") -> dict:
+    if day:
+        day_offset = alerts.offset_for(day, _tz())
     if to_phone and not telegram.configured():
         raise RuntimeError("phone messages are not set up yet")
     if in_minutes:
@@ -306,8 +309,10 @@ async def set_reminder(client: httpx.AsyncClient, text: str, at: str = "", day_o
 
 
 async def set_alarm(client: httpx.AsyncClient, at: str, day_offset: int = 0, repeat: str = "once",
-                    label: str = "") -> dict:
+                    label: str = "", day: str = "") -> dict:
     """Wake-up alarm: rings on the speaker with the morning briefing (prepared just before, see main.py)."""
+    if day:
+        day_offset = alerts.offset_for(day, _tz())
     due = alerts.due_at(at, int(day_offset or 0), _tz())
     return {"set": alerts.add("alarm", label or "wake up", due, _tz(), repeat=repeat or "once")}
 
@@ -433,13 +438,15 @@ TOOLS = {
     "set_reminder": (set_reminder, "Remind the user of something later; the speaker says it at that time.", {
         "text": {"type": "string", "description": "What to remind, e.g. call mum"},
         "at": {"type": "string", "description": "Local time HH:MM, 24h"},
-        "day_offset": {"type": "integer", "description": "0 = today, 1 = tomorrow..."},
+        "day": {"type": "string", "description": "\"tomorrow\" or a weekday name (\"friday\"); omit for today"},
+        "day_offset": {"type": "integer", "description": "Instead of day: 0 = today, 1 = tomorrow..."},
         "in_minutes": {"type": "number", "description": "Instead of at: minutes from now"},
         "to_phone": {"type": "boolean", "description": "Also send it to the user's phone (\"remind me on my phone\")"}}),
     "set_alarm": (set_alarm, "Wake-up alarm (\"wake me at 7:30\"): at that time the speaker wakes the user up with "
                              "the morning briefing. Can repeat (\"every weekday\").", {
         "at": {"type": "string", "description": "Local time HH:MM, 24h"},
-        "day_offset": {"type": "integer", "description": "0 = next time it's HH:MM, 1 = tomorrow..."},
+        "day": {"type": "string", "description": "\"tomorrow\" or a weekday name (\"saturday\"); omit for the next HH:MM"},
+        "day_offset": {"type": "integer", "description": "Instead of day: 0 = next time it's HH:MM, 1 = tomorrow..."},
         "repeat": {"type": "string", "enum": ["once", "daily", "weekdays", "weekends"]},
         "label": {"type": "string", "description": "Optional, e.g. gym"}}),
     "list_alerts": (list_alerts, "List the alarms, timers and reminders that are set, with time left.", {}),

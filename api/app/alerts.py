@@ -186,6 +186,24 @@ def announcement(a: dict) -> str:
     return f"Rocky reminder: {a['label']}. Rocky remember for you, good, good, good."
 
 
+WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+
+
+def offset_for(day: str, tz) -> int:
+    """Days from today to `day` ("today", "tomorrow" or a weekday name, English or Spanish); 0 = today."""
+    d = (day or "").strip().lower()
+    spanish = {"lunes": 0, "martes": 1, "miercoles": 2, "miércoles": 2, "jueves": 3, "viernes": 4, "sabado": 5,
+               "sábado": 5, "domingo": 6}
+    if d in ("", "today", "hoy"):
+        return 0
+    if d in ("tomorrow", "mañana", "manana"):
+        return 1
+    target = WEEKDAYS.index(d) if d in WEEKDAYS else spanish.get(d)
+    if target is None:
+        raise ValueError(f"day not understood: {day!r}")
+    return (target - datetime.now(tz).weekday()) % 7  # 0 = today (rolls a week ahead if the time already passed)
+
+
 def due_at(hhmm: str, day_offset: int, tz) -> float:
     """Epoch seconds for HH:MM local time, `day_offset` days from today (rolls to tomorrow if already past)."""
     # The model writes times as "07:30", "7:30 AM", "22.42" or just "7": accept them all.
@@ -203,4 +221,6 @@ def due_at(hhmm: str, day_offset: int, tz) -> float:
     due = (now + timedelta(days=day_offset)).replace(hour=hour, minute=minute, second=0, microsecond=0)
     if due <= now and day_offset == 0:
         due += timedelta(days=1)
+    elif due <= now:  # e.g. "Saturday 8:00" asked on Saturday at 9: next week
+        due += timedelta(days=7)
     return due.timestamp()

@@ -16,7 +16,7 @@ ESP32 (idle) --GET /pending every 3 s--> due alarm/timer/reminder? -> Rocky's an
 
 1. **STT**: [faster-whisper](https://github.com/SYSTRAN/faster-whisper) transcribes the uploaded WAV.
 2. **LLM**: the transcript goes to any OpenAI-compatible `/chat/completions` endpoint (Ollama, llama.cpp, LM Studio,
-   vLLM…). The default system prompt gives it Rocky's personality ("Rocky fix ship. Good, good, good!").
+   vLLM…). The default system prompt gives it Rocky's personality as written in the book: a warm, practical engineer friend in short, literal "Rocky English" ("I fix. Good good.", "You sleep. Human no function well after no sleep.", "Amaze!", "...question?").
 3. **TTS**: [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) 12Hz 0.6B Base clones Rocky's voice zero-shot from a
    reference clip plus its exact transcript, picked by ear in the Rocky voice project (`~/src/repos/rocky`). The reply is
    downsampled to a 16 kHz / 16-bit / mono WAV the ESP32 can play.

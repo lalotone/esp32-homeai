@@ -33,6 +33,16 @@ _CLAIM = re.compile(r"\b(set|added|sent|cancel+ed|removed|cleared|done|ready|on 
 _NUDGE = ("[Check: you called no tool, so nothing was set, added, sent or cancelled. If this request needs a tool, "
           "call it now. If you really must ask the user something first, reply with only that question.]")
 _DIDNT_WORK = "Hmm, Rocky could not do that. Say it again, question?"
+# A reply about the weather with no weather tool this turn is invented or an unkept "I check" (seen: "Rain tonight, so
+# run bad" with no lookup). Nudging the model doesn't fix it reliably, so the API fetches the weather itself and asks
+# again with the real data.
+_WEATHER_FACT = re.compile(r"\b(\d+(\.\d+)?\s*(degrees|°)|rain\w*|sunny|cloud\w*|overcast|wind\w*|snow\w*|storm\w*|"
+                           r"weather|sky)\b", re.I)
+_WEATHER_TOOLS = {"get_weather", "get_morning_briefing"}
+# ...and an outdoors question answered with an unkept "I check" or a "cannot find out" that never tried.
+_WEATHER_ASK = re.compile(r"\b(weather|run|walk|beach|laundry|jacket|coat|umbrella|outside|cold|hot|warm|rain\w*|"
+                          r"sun\w*|bike|hike|picnic|terrace)\b", re.I)
+_DODGE = re.compile(r"\b(check|look|find out|cannot know|can't know|outside)\b", re.I)
 PHOTO_TOOLS = {"look_at_last_photo", "add_photo_item_to_shopping_list"}  # their results come from a photo
 
 # Recent exchanges as (time, messages of that turn). One speaker, one conversation, so module state is enough.
@@ -82,6 +92,8 @@ async def _chat(user_text: str, from_user: bool = True) -> tuple[str, list[dict]
         payload["tools"] = tools.schemas()
     action = from_user and settings.tools_enabled and bool(_ACTION.search(user_text))
     used_tool = nudged = False
+    used_names: set[str] = set()
+    fetched_weather = False
     if settings.llm_enable_thinking:
         payload["chat_template_kwargs"] = {"enable_thinking": settings.llm_enable_thinking.lower() == "true"}
     if settings.llm_keep_alive:
@@ -98,6 +110,20 @@ async def _chat(user_text: str, from_user: bool = True) -> tuple[str, list[dict]
             calls = message.get("tool_calls") or []
             if not calls:
                 reply = (message.get("content") or "").strip()
+                if (from_user and "tools" in payload and "get_weather" in tools.TOOLS and not fetched_weather
+                        and not used_names & _WEATHER_TOOLS
+                        and (_WEATHER_FACT.search(reply) or (_WEATHER_ASK.search(user_text) and _DODGE.search(reply)))):
+                    fetched_weather = True
+                    logger.info("weather answered without the tool, fetching it: %r", reply)
+                    call = {"id": "auto_weather", "type": "function", "function": {"name": "get_weather", "arguments": "{}"}}
+                    step = [{"role": "assistant", "content": "", "tool_calls": [call]},
+                            {"role": "tool", "tool_call_id": "auto_weather",
+                             "content": await tools.run(client, "get_weather", "{}")}]
+                    messages.extend(step)
+                    turn.extend(step)
+                    used_tool = True
+                    used_names.add("get_weather")
+                    continue
                 if action and not used_tool and "tools" in payload:
                     if not nudged:  # the nudge is for this request only: not kept in the history
                         nudged = True
@@ -111,6 +137,7 @@ async def _chat(user_text: str, from_user: bool = True) -> tuple[str, list[dict]
                 return reply, turn
 
             used_tool = True
+            used_names |= {c["function"]["name"] for c in calls}
             step = [{"role": "assistant", "content": message.get("content") or "", "tool_calls": calls}]
             results = await asyncio.gather(*(tools.run(client, c["function"]["name"], c["function"].get("arguments"))
                                              for c in calls))
