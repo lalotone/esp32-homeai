@@ -21,7 +21,7 @@ static const char *FORM_HTML =
     "<h2>Board Setup</h2>"
     "<form method='POST' action='/save'>"
     "<label>WiFi SSID</label><br><input name='ssid' value='%s' maxlength='31' style='width:100%%'><br><br>"
-    "<label>WiFi Password</label><br><input name='pass' type='password' maxlength='63' style='width:100%%'><br><br>"
+    "<label>WiFi Password</label><br><input name='pass' type='password' maxlength='63' placeholder='(empty = keep current, same SSID)' style='width:100%%'><br><br>"
     "<label>Assistant server URL</label><br><input name='url' value='%s' maxlength='127' style='width:100%%'><br><br>"
     "<button type='submit'>Save &amp; Reboot</button>"
     "</form></body></html>";
@@ -97,6 +97,17 @@ static esp_err_t save_post_handler(httpd_req_t *req)
     if (strlen(ssid) == 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SSID required");
         return ESP_FAIL;
+    }
+
+    // An empty password with the same SSID keeps the saved one, so changing only the server URL doesn't need the
+    // WiFi password again. A different SSID with an empty password still means an open network.
+    if (strlen(pass) == 0) {
+        char cur_ssid[APP_CONFIG_SSID_MAX_LEN] = { 0 };
+        char cur_pass[APP_CONFIG_PASS_MAX_LEN] = { 0 };
+        app_config_get_wifi(cur_ssid, sizeof(cur_ssid), cur_pass, sizeof(cur_pass));
+        if (strcmp(ssid, cur_ssid) == 0) {
+            strlcpy(pass, cur_pass, sizeof(pass));
+        }
     }
 
     app_config_set_wifi(ssid, pass);

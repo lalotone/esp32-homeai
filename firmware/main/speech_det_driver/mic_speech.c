@@ -6,14 +6,28 @@
 #include "esp_afe_sr_models.h"
 #include "esp_mn_iface.h"
 #include "esp_mn_models.h"
+#include "esp_mn_speech_commands.h"
 #include "model_path.h"
 #include "esp_process_sdkconfig.h"
 
 #include "bsp_board.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_task_wdt.h"
 
 static const char *TAG = "App/Speech";
+
+// Second wake phrase, "Hey Rocky", next to WakeNet's "Alexa". There is no WakeNet model for it, so it runs on
+// MultiNet7 (English speech commands: the phrase is plain text, no training). MultiNet is built to listen for a
+// few seconds after a wake word; here it listens all the time, in back-to-back windows, so it is less robust
+// than "Alexa". Every MultiNet hit is logged with its probability to tune this against false wakes.
+#define ROCKY_COMMAND_ID 1
+#define ROCKY_WINDOW_MS  6000   // MultiNet times out after this; we restart it right away and keep listening
+static const char *rocky_phrases[] = {
+    "hey rocky",
+    "hey roki",                 // spelling variants: MultiNet7 turns text into English phonemes, so these
+    "hi rocky",                 // widen it a bit for a Spanish accent ("hey" heard as "hi", a shorter "o")
+};
 
 
 int wakeup_flag = 0;
@@ -58,33 +72,82 @@ void feed_Task(void *arg)
     vTaskDelete(NULL);
 }
 
+static model_iface_data_t *rocky_init(esp_mn_iface_t **multinet_out, int afe_chunksize)
+{
+    char *mn_name = esp_srmodel_filter(models, ESP_MN_PREFIX, ESP_MN_ENGLISH);
+    if (!mn_name) {
+        ESP_LOGW(TAG, "No English MultiNet model in the 'model' partition: \"Hey Rocky\" disabled, \"Alexa\" only");
+        return NULL;
+    }
+    esp_mn_iface_t *multinet = esp_mn_handle_from_name(mn_name);
+    model_iface_data_t *model_data = multinet->create(mn_name, ROCKY_WINDOW_MS);
+    // All weights in PSRAM where the model supports choosing (MultiNet7 leaves this NULL: calling it panics).
+    if (multinet->switch_loader_mode) {
+        model_data = multinet->switch_loader_mode(model_data, ESP_MN_LOAD_FROM_PSRAM);
+    }
+    assert(multinet->get_samp_chunksize(model_data) == afe_chunksize);
+
+    esp_mn_commands_alloc(multinet, model_data);
+    for (size_t i = 0; i < sizeof(rocky_phrases) / sizeof(rocky_phrases[0]); i++) {
+        esp_mn_commands_add(ROCKY_COMMAND_ID, rocky_phrases[i]);
+    }
+    esp_mn_error_t *err = esp_mn_commands_update();
+    if (err) {
+        for (int i = 0; i < err->num; i++) {
+            ESP_LOGW(TAG, "MultiNet rejected phrase \"%s\"", err->phrases[i]->string);
+        }
+    }
+    ESP_LOGI(TAG, "\"Hey Rocky\" on %s:", mn_name);
+    multinet->print_active_speech_commands(model_data);
+    *multinet_out = multinet;
+    return model_data;
+}
+
 void detect_Task(void *arg)
 {
-    uint8_t backlight_last = 0;
     esp_afe_sr_data_t *afe_data = arg;
-    int afe_chunksize = afe_handle->get_fetch_chunksize(afe_data);
-    char *mn_name = esp_srmodel_filter(models, ESP_MN_PREFIX, ESP_MN_ENGLISH);
-    printf("multinet:%s\n", mn_name);
-    esp_mn_iface_t *multinet = esp_mn_handle_from_name(mn_name);
-    model_iface_data_t *model_data = multinet->create(mn_name, 8000);
-    int mu_chunksize = multinet->get_samp_chunksize(model_data);
-    esp_mn_commands_update_from_sdkconfig(multinet, model_data); // Add speech commands from sdkconfig
-    assert(mu_chunksize == afe_chunksize);
-    //print active speech commands
-    multinet->print_active_speech_commands(model_data);
+    esp_mn_iface_t *multinet = NULL;
+    model_iface_data_t *mn_data = rocky_init(&multinet, afe_handle->get_fetch_chunksize(afe_data));
+
+    // A reply is downloaded whole into PSRAM (up to 2 MB), so this is the headroom left for it.
+    ESP_LOGI(TAG, "Speech ready, PSRAM free: %u KB (largest block %u KB)",
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+             (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024));
 
     esp_task_wdt_add(NULL);      // 先订阅当前任务
 
     while (task_flag) {
-        afe_fetch_result_t* res = afe_handle->fetch(afe_data); 
+        afe_fetch_result_t* res = afe_handle->fetch(afe_data);
         if (!res || res->ret_value == ESP_FAIL) {
-            printf("fetch error!\n");
-            break;
+            // Transient: right after an ask round-trip the AFE ring can be briefly
+            // starved (feed_Task was paused while we recorded/uploaded/played).
+            // Back off and retry instead of tearing the detector down on one bad fetch.
+            vTaskDelay(pdMS_TO_TICKS(5));
+            esp_task_wdt_reset();
+            continue;
         }
 
-        if (res->wakeup_state == WAKENET_DETECTED) {
-            //printf("WAKEWORD DETECTED\n");
-	        multinet->clean(model_data);
+        // Fire on a verified wake: single-channel is WAKENET_DETECTED, while a
+        // multi-channel AFE must wait for WAKENET_CHANNEL_VERIFIED (channel confirmed).
+        bool woken = false;
+        if (res->raw_data_channels == 1 && res->wakeup_state == WAKENET_DETECTED) {
+            woken = true;
+        } else if (res->raw_data_channels > 1 && res->wakeup_state == WAKENET_CHANNEL_VERIFIED) {
+            woken = true;
+        }
+
+        // "Hey Rocky": MultiNet on the same AFE output. A timeout just means nobody said it in this window.
+        bool rocky = false;
+        if (mn_data) {
+            esp_mn_state_t mn_state = multinet->detect(mn_data, res->data);
+            if (mn_state == ESP_MN_STATE_DETECTED) {
+                esp_mn_results_t *r = multinet->get_results(mn_data);
+                ESP_LOGI(TAG, "MultiNet heard \"%s\" (command %d, prob %.3f)", r->string, r->command_id[0], r->prob[0]);
+                rocky = r->num > 0 && r->command_id[0] == ROCKY_COMMAND_ID;
+                multinet->clean(mn_data);
+            } else if (mn_state == ESP_MN_STATE_TIMEOUT) {
+                multinet->clean(mn_data);
+            }
         }
 
         // The wakeup_flag == 0 guard is the real fix: WakeNet evaluates a ~1.5s
@@ -93,67 +156,36 @@ void detect_Task(void *arg)
         // disable_wakenet() below takes effect -- disabling alone only stops
         // *future* inference, it doesn't un-queue results already computed.
         // Gating on wakeup_flag makes re-firing impossible regardless of timing.
-        if (res->raw_data_channels == 1 && res->wakeup_state == WAKENET_DETECTED && wakeup_flag == 0) {
+        if ((woken || rocky) && wakeup_flag == 0) {
             afe_handle->disable_wakenet(afe_data);
             wakeup_flag = 1;
-        } else if (res->raw_data_channels > 1 && res->wakeup_state == WAKENET_CHANNEL_VERIFIED && wakeup_flag == 0) {
-            // For a multi-channel AFE, it is necessary to wait for the channel to be verified.
-            //printf("AFE_FETCH_CHANNEL_VERIFIED, channel index: %d\n", res->trigger_channel_id);
-            afe_handle->disable_wakenet(afe_data);
+
             esp_sr_evt_data_t evtdata;
-            evtdata.awaken_channel = res->trigger_channel_id;
-            if(spench_callback!=NULL)
-            {
-                spench_callback(ESP_SR_EVT_AWAKEN,evtdata,NULL);
+            evtdata.awaken_channel = (woken && res->raw_data_channels > 1) ? res->trigger_channel_id : 0;
+            ESP_LOGI(TAG, "Wake word detected (%s, ch=%d), capturing + asking", woken ? "Alexa" : "Hey Rocky",
+                     (int)evtdata.awaken_channel);
+            if (spench_callback != NULL) {
+                // Synchronous: the callback runs the whole ask round-trip (VAD
+                // capture + upload + playback) before returning, so the wake word
+                // stays disabled and cannot re-fire in the middle of the request.
+                // A conversation (with follow-ups) lasts well past the watchdog's
+                // 5 s, so this task leaves the watchdog for its duration.
+                esp_task_wdt_delete(NULL);
+                spench_callback(ESP_SR_EVT_AWAKEN, evtdata, NULL);
+                esp_task_wdt_add(NULL);
             }
-            wakeup_flag = 1;
+
+            afe_handle->enable_wakenet(afe_data);
+            if (mn_data) {
+                multinet->clean(mn_data); // drop whatever it half-heard before/while answering
+            }
+            wakeup_flag = 0;
         }
 
         esp_task_wdt_reset();
-        if (wakeup_flag == 1) {
-            
-            esp_mn_state_t mn_state = multinet->detect(model_data, res->data);
-
-            if (mn_state == ESP_MN_STATE_DETECTING) {
-                continue;
-            }
-
-            if (mn_state == ESP_MN_STATE_DETECTED) {
-                esp_mn_results_t *mn_result = multinet->get_results(model_data);
-
-                //ESP_LOGI(TAG, "TOP %d, command_id: %d, phrase_id: %d, string:%s prob: %f\n", 
-                //1, mn_result->command_id[0], mn_result->phrase_id[0], mn_result->string, mn_result->prob[0]);
-
-                esp_sr_evt_data_t evtdata;
-                evtdata.sr_cmd = mn_result->command_id[0];
-                if(spench_callback!=NULL)
-                {
-                    spench_callback(ESP_SR_EVT_CMD,evtdata,NULL);
-                }
-            }
-
-            if (mn_state == ESP_MN_STATE_TIMEOUT) {
-                esp_mn_results_t *mn_result = multinet->get_results(model_data);
-                //printf("timeout, string:%s\n", mn_result->string);
-                afe_handle->enable_wakenet(afe_data);
-                wakeup_flag = 0;
-
-                esp_sr_evt_data_t evtdata;
-                if(spench_callback!=NULL)
-                {
-                    spench_callback(ESP_SR_EVT_CMD_TIMEOUT,evtdata,NULL);
-                }
-
-                continue;
-            }
-
-        }
-        esp_task_wdt_reset();
-        
     }
-    if (model_data) {
-        multinet->destroy(model_data);
-        model_data = NULL;
+    if (mn_data) {
+        multinet->destroy(mn_data);
     }
     printf("detect exit\n");
     vTaskDelete(NULL);
