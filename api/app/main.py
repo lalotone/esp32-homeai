@@ -11,19 +11,23 @@ text also come back as URL-encoded headers (X-Transcript / X-Reply) for debuggin
 """
 import asyncio
 import io
+import json
 import logging
 import math
 import os
 import tempfile
 import wave
+from datetime import datetime
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
+import httpx
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 from starlette.concurrency import run_in_threadpool
 
-from . import alerts, llm, stt, telegram, tts
+from . import alerts, llm, songs, stt, telegram, tools, tts
 from .config import settings
 
 logger = logging.getLogger("uvicorn.error")
@@ -94,6 +98,44 @@ async def start_phone_loop() -> None:
         asyncio.get_running_loop().create_task(_phone_loop())
 
 
+# Wake-up alarms ring with the morning briefing. Composing it (tools + LLM + TTS of ~80 words) takes ~15 s, as long
+# as the speaker's /pending timeout, so it's prepared ahead and /pending only hands over the audio.
+ALARM_PREPARE_S = 120
+_alarm_audio: dict[str, tuple[str, bytes]] = {}  # alert id -> (text, wav)
+
+
+async def _prepare_alarms() -> None:
+    for a in alerts.upcoming("alarm", ALARM_PREPARE_S):
+        if a["id"] in _alarm_audio:
+            continue
+        try:
+            async with httpx.AsyncClient() as client:
+                briefing = await tools.get_morning_briefing(client)
+            at = datetime.fromtimestamp(a["due"], ZoneInfo(settings.home_tz)).strftime("%H:%M")
+            if isinstance(briefing.get("now"), dict):
+                briefing["now"]["local_time"] = at  # composed ~2 min early: say the time it rings, not now
+            text = await llm.chat(
+                f"[Wake-up alarm ({a['label']}) ringing at {at}. Briefing data: {json.dumps(briefing, ensure_ascii=False)}]"
+                " Wake the user up, Rocky style: start with \"Beep, beep, beep! Wake up, wake up, wake up!\", then a"
+                " warm, short morning briefing as usual, using the time above. Under 80 words.", from_user=False)
+            wav_bytes = await run_in_threadpool(tts.synthesize, text)
+            _alarm_audio[a["id"]] = (text, wav_bytes)
+            logger.info("alarm %s prepared for %s: %r", a["id"], at, text)
+        except Exception as e:  # the plain "wake up" fallback still rings
+            logger.warning("could not prepare alarm %s: %r", a["id"], e)
+
+
+async def _alarm_loop() -> None:
+    while True:
+        await asyncio.sleep(20)
+        await _prepare_alarms()
+
+
+@app.on_event("startup")
+async def start_alarm_loop() -> None:
+    asyncio.get_running_loop().create_task(_alarm_loop())
+
+
 @app.get("/pending")
 async def pending() -> Response:
     """Polled by the ESP32 while idle: Rocky's announcement of a due timer/reminder as a WAV, or 204 if none.
@@ -106,9 +148,13 @@ async def pending() -> Response:
         alert = alerts.pop_due()
         if alert is None:
             return Response(status_code=204)
-        text = alerts.announcement(alert)
+        prepared = _alarm_audio.pop(alert["id"], None)
+        if prepared:
+            text, wav_bytes = prepared
+        else:
+            text = alerts.announcement(alert)
+            wav_bytes = await run_in_threadpool(tts.synthesize, text)
         logger.info("announcing %s: %r", alert["kind"], text)
-        wav_bytes = await run_in_threadpool(tts.synthesize, text)
     return Response(content=wav_bytes, media_type="audio/wav", headers={"X-Reply": quote(text)})
 
 
@@ -189,6 +235,22 @@ async def _talk(request: Request, audio: UploadFile | None) -> Response:
         in_path = tmp.name
 
     try:
+        # "What song is this?": this recording is the music sample the identify_song tool asked for, so it goes to
+        # Shazam instead of the silence gate and Whisper (music isn't speech, and may be quiet).
+        if songs.take_armed():
+            result = await songs.recognize(data)
+            sent = False
+            if result.get("match") and telegram.configured():  # the song name on the phone, to find it later
+                try:
+                    await telegram.send(songs.phone_message(result))
+                    sent = True
+                except telegram.TelegramError as e:
+                    logger.warning("song not sent to the phone: %s", e)
+            reply = await llm.chat(songs.as_prompt(result, sent), from_user=False)
+            wav_bytes = await run_in_threadpool(tts.synthesize, reply)
+            return Response(content=wav_bytes, media_type="audio/wav",
+                            headers={"X-Transcript": quote("(music)"), "X-Reply": quote(reply)})
+
         # Silence gate: the firmware uploads whatever it captured (even pure
         # silence), so the API is the place that decides "nothing was said".
         dbfs = await run_in_threadpool(_input_rms_dbfs, in_path)
@@ -207,6 +269,8 @@ async def _talk(request: Request, audio: UploadFile | None) -> Response:
             logger.info("Empty transcript: skipping STT/LLM/TTS (silence #%d)", _talk_counts["silence"])
             return _silence_response()
 
+        if songs.is_request(transcript):
+            songs.arm()  # the next recording is the music sample, whether or not the model calls identify_song
         reply = await llm.chat(transcript)
         wav_bytes = await run_in_threadpool(tts.synthesize, reply)
     finally:

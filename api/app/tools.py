@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-from . import alerts, shopping, telegram
+from . import alerts, shopping, songs, telegram
 from .config import settings
 
 logger = logging.getLogger("uvicorn.error")
@@ -305,12 +305,19 @@ async def set_reminder(client: httpx.AsyncClient, text: str, at: str = "", day_o
     return {"set": alerts.add("reminder", text, due, _tz(), phone=bool(to_phone))}
 
 
+async def set_alarm(client: httpx.AsyncClient, at: str, day_offset: int = 0, repeat: str = "once",
+                    label: str = "") -> dict:
+    """Wake-up alarm: rings on the speaker with the morning briefing (prepared just before, see main.py)."""
+    due = alerts.due_at(at, int(day_offset or 0), _tz())
+    return {"set": alerts.add("alarm", label or "wake up", due, _tz(), repeat=repeat or "once")}
+
+
 async def list_alerts(client: httpx.AsyncClient) -> dict:
     return {"timers_and_reminders": alerts.listing(_tz())}
 
 
-async def cancel_alert(client: httpx.AsyncClient, label: str = "") -> dict:
-    gone = alerts.cancel(label, _tz())
+async def cancel_alert(client: httpx.AsyncClient, label: str = "", kind: str = "") -> dict:
+    gone = alerts.cancel(label, _tz(), kind or None)
     if not gone:
         raise LookupError(f"no timer or reminder matching '{label}'" if label else "no timers or reminders set")
     return {"cancelled": gone}
@@ -351,6 +358,13 @@ async def send_shopping_list(client: httpx.AsyncClient) -> dict:
         raise LookupError("the shopping list is empty, nothing to send")
     await telegram.send("🛒 Shopping list\n" + "\n".join(f"• {i}" for i in items))
     return {"sent": True, "items": len(items)}
+
+
+# --- "what song is this?" (songs.py) ---
+
+async def identify_song(client: httpx.AsyncClient) -> dict:
+    songs.arm()
+    return {"listening": True, "next": "the next recording is the music sample; tell the user to keep it playing"}
 
 
 # --- good-morning briefing ---
@@ -400,9 +414,18 @@ TOOLS = {
         "day_offset": {"type": "integer", "description": "0 = today, 1 = tomorrow..."},
         "in_minutes": {"type": "number", "description": "Instead of at: minutes from now"},
         "to_phone": {"type": "boolean", "description": "Also send it to the user's phone (\"remind me on my phone\")"}}),
-    "list_alerts": (list_alerts, "List the timers and reminders that are set, with time left.", {}),
-    "cancel_alert": (cancel_alert, "Cancel timers/reminders whose label contains the text; empty = all.", {
-        "label": {"type": "string"}}),
+    "set_alarm": (set_alarm, "Wake-up alarm (\"wake me at 7:30\"): at that time the speaker wakes the user up with "
+                             "the morning briefing. Can repeat (\"every weekday\").", {
+        "at": {"type": "string", "description": "Local time HH:MM, 24h"},
+        "day_offset": {"type": "integer", "description": "0 = next time it's HH:MM, 1 = tomorrow..."},
+        "repeat": {"type": "string", "enum": ["once", "daily", "weekdays", "weekends"]},
+        "label": {"type": "string", "description": "Optional, e.g. gym"}}),
+    "list_alerts": (list_alerts, "List the alarms, timers and reminders that are set, with time left.", {}),
+    "cancel_alert": (cancel_alert, "Cancel alarms/timers/reminders whose label contains the text (alarms are "
+                                   "labelled \"wake up\" unless named); empty = all of that kind.", {
+        "label": {"type": "string"},
+        "kind": {"type": "string", "enum": ["alarm", "timer", "reminder"],
+                 "description": "Only this kind (\"cancel my alarms\" = alarm); omit for any"}}),
     "add_to_shopping_list": (add_to_shopping_list, "Add items to the shopping list (one entry per item).", {
         "items": {"type": "array", "items": {"type": "string"}, "description": "e.g. [\"milk\", \"2 onions\"]"}}),
     "remove_from_shopping_list": (remove_from_shopping_list, "Remove bought or unwanted items from the shopping list.", {
@@ -414,11 +437,14 @@ TOOLS = {
                                      "address, the weather. Write the full text to send.", {
         "text": {"type": "string"}}),
     "send_shopping_list": (send_shopping_list, "Send the shopping list to the user's phone (Telegram).", {}),
+    "identify_song": (identify_song, "Identify the song that is playing (like Shazam), when the user asks what song "
+                                     "this is. Then just tell them, in a few words, that Rocky is listening and to "
+                                     "keep the music on: the speaker records it next and you get the result.", {}),
     "get_morning_briefing": (get_morning_briefing, "Morning briefing for \"good morning\" or \"what's my day\": "
                                                    "time, today's weather, today's reminders, 2 world news, "
                                                    "shopping list size. Use it instead of the separate tools.", {}),
 }
-_REQUIRED = {"calculate": ["expression"], "lookup_wikipedia": ["topic"], "set_reminder": ["text"],
+_REQUIRED = {"calculate": ["expression"], "lookup_wikipedia": ["topic"], "set_reminder": ["text"], "set_alarm": ["at"],
              "add_to_shopping_list": ["items"], "remove_from_shopping_list": ["items"], "send_to_phone": ["text"]}
 
 

@@ -7,3 +7,5 @@ rocky/*
 !rocky/README.md
 *.wav
 headers.txt
+# Timers, alarms, reminders and the shopping list (STATE_DIR): personal data
+state/

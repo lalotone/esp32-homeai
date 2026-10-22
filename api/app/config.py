@@ -68,15 +68,16 @@ class Settings:
         " avoid jargon and acronyms. Do NOT number them (no \"first\", \"one, two\", \"two things\"). Skip grim"
         " details. Then one short Rocky-style reaction. Under 50 words in total. Spanish news is told in English. If a tool"
         " fails, say Rocky cannot find out"
-        " now. You can set timers and reminders (the speaker announces them when due) ONLY by calling set_timer or"
-        " set_reminder: never say one is set, listed or cancelled unless that tool just succeeded in this turn."
+        " now. You can set wake-up alarms, timers and reminders (the speaker announces them when due) ONLY by calling"
+        " set_alarm, set_timer or set_reminder: never say one is set, listed or cancelled unless that tool just"
+        " succeeded in this turn. \"Wake me up at...\" means set_alarm."
         " Confirm in a few words with the time. The shopping list works the same way: add, remove, read or clear it"
         " ONLY through its tools, and never claim a change the tool didn't make; when reading it, list the items"
         " plainly. For \"good morning\" or \"what's my day\", call get_morning_briefing and give a warm,"
         " short briefing: greeting, weather, any reminders today, then the news in plain English, and how many"
         " things are on the shopping list if any. Under 70 words. You can send messages to the user's phone"
         " (send_to_phone, send_shopping_list, or set_reminder with to_phone): only when asked, and say it's sent"
-        " only if the tool succeeded. For the homelab (the user's home Kubernetes cluster), say in plain words if all is fine"
+        " only if the tool succeeded. When asked what song is playing, always call identify_song first. For the homelab (the user's home Kubernetes cluster), say in plain words if all is fine"
         " and mention only real problems, GPU temperatures and free disk. You cannot do lights or music: say so"
         " simply. Never pretend or "
         "promise to do things you cannot do. Reply ONLY with the words to speak aloud: no stage directions, "
@@ -143,7 +144,9 @@ class Settings:
     # firmware still uploads the recording; the API measures its RMS and, if it is
     # below this level (dBFS, 0 dBFS = full scale), skips the STT/LLM/TTS pipeline,
     # counts it, and returns a short silent reply. Lower = stricter.
-    silence_threshold_dbfs: float = float(_get("SILENCE_THRESHOLD_DBFS", "-40"))
+    # -55 matches the firmware's own VAD start level. The RMS covers the whole clip, lead-in silence included, so
+    # real speech through the board's mics averages -45..-48 dBFS: -40 threw real questions away.
+    silence_threshold_dbfs: float = float(_get("SILENCE_THRESHOLD_DBFS", "-55"))
     # Length in seconds of the silent "nothing heard" reply the ESP32 plays back.
     silence_reply_seconds: float = float(_get("SILENCE_REPLY_SECONDS", "0.4"))
 

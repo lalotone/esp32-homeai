@@ -13,4 +13,5 @@ torchaudio==2.9.1
 # the transformers-5 build of qwen-tts that provides the same `qwen_tts` package (don't install upstream qwen-tts too).
 faster-qwen3-tts==0.5.4
 qwen-tts-hf==0.1.1.post1
+shazamio==0.8.1  # "what song is this?": unofficial Shazam client (no key; may break if Shazam changes its API)
 transformers==5.15.1  # newer 5.x fails loading the speech tokenizer: 'MimiConfig' object has no attribute 'rope_theta'
