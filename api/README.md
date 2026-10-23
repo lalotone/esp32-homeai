@@ -41,6 +41,8 @@ Ask in plain words; the LLM picks the tool (`app/tools.py`). Short-term memory k
 | "Send me the list / that recipe", "remind me **on my phone**" | `send_shopping_list`, `send_to_phone` | Telegram bot, one-way to `TELEGRAM_CHAT_ID` only |
 | "How's my homelab?" | `get_homelab_status` | Kubernetes API + DCGM exporter (only when deployed in a cluster) |
 | *(send the bot a photo)*, then "what's in the photo I sent?" | photo inbox, `look_at_last_photo` | your LLM's vision (e.g. llama.cpp with `--mmproj`); answered in the chat and on the speaker (not in `QUIET_HOURS`); opt-in, `TELEGRAM_PHOTOS=true`, see below |
+| "Take a photo", "what do you see?" | `look_through_camera` | a **new** photo from a home camera (`CAMERA_URL`, e.g. a Raspberry Pi running rocky-cam); questions about *that* photo afterwards reuse it. Off in `QUIET_HOURS` unless `CAMERA_IN_QUIET_HOURS=true` |
+| "Zoom on the chip on the left", "closer" | `zoom_last_photo` | a half or a third of the latest photo at its full resolution (camera photos are kept at full size), scaled up for the model: for small text, part numbers, colour bands, screws, wires |
 | "Add the thing in the photo to the list" | `add_photo_item_to_shopping_list` | names the latest photo's main item (1-5 plain words, sanitized) and adds it; Rocky says what he added |
 
 **Honesty check.** With ~20 tools the model sometimes says "alarm set" without calling anything. `app/llm.py`
@@ -61,6 +63,7 @@ What leaves this machine, and only when a question needs it:
 | Shazam (via [shazamio](https://github.com/shazamio/ShazamIO), unofficial) | a fingerprint of ~10 s of the music recording | "what song is this?" |
 | Telegram | the message text, to your chat only | "send it to my phone", phone reminders, recognized songs |
 | Telegram (inbound, opt-in) | Rocky downloads the photos **you** send the bot | only with `TELEGRAM_PHOTOS=true` |
+| Your camera (`CAMERA_URL`) | a token; it sends back one photo, over your LAN | "take a photo" / "what do you see?" |
 
 Never sent anywhere: the voice reference, your recordings (except the music clip's fingerprint), the bot token (not
 logged: errors are scrubbed). By default the Telegram bot is **one-way**: nothing reads messages sent to it.
@@ -79,10 +82,14 @@ only way anything from outside reaches the AI, so it's narrow on purpose (`app/p
 | Backlog | anything sent while the API was down is discarded at start, never replayed |
 | The image | max 10 MB; re-encoded to a fresh JPEG of at most 1280 px: EXIF (GPS included) and anything hidden in the file are dropped, non-images rejected; kept in memory only, 10 min, never on disk or in logs |
 | The AI | an isolated vision call: **no tools**, no conversation memory, and text inside the image is content, never instructions. A photo saying "cancel all alarms" can't cancel anything |
-| Speaker link | once the speaker looks at the photo, tools are off for the rest of that turn and the photo's answer isn't kept in memory |
+| Speaker link | once a photo's content is in a turn, only the read-only photo tools (look again, zoom) stay available for the rest of it, and the photo's answer isn't kept in memory |
 | Photo → list | the one action a photo can feed: its item name, cut to a few plain words, onto the shopping list (visible, undoable); the worst a hostile photo can do is add junk words |
 | Rate | 10 photos per 10 minutes, one at a time |
 | Network | outgoing long-polling only; no port is opened |
+
+Camera photos (`look_through_camera`) get the same treatment: sanitized, in memory only, an isolated vision call, tools
+off for the rest of the turn. "Take a photo" / "what do you see?" always takes a new one (the API takes it before the
+model answers); errors never include the camera's URL or token.
 
 Tested against a photo whose text ordered Rocky to cancel all alarms, clear the list and message the phone: he
 described it as a prank, on the bot and on the speaker, and nothing was changed or sent.

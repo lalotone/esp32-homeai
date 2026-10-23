@@ -379,9 +379,21 @@ async def look_at_last_photo(client: httpx.AsyncClient, question: str = "") -> d
     once this runs, and keeps the answer out of the conversation memory: text in a photo must not drive actions."""
     p = photos.last_photo()
     if not p:
-        raise LookupError("no photo in the last 10 minutes; the user can send one to the Telegram bot")
+        raise LookupError("no photo in the last 10 minutes; ask Rocky to take one, or send one to the Telegram bot")
     answer = await photos.look(p["jpeg"], question) if question else p["answer"]
     return {"about_the_photo": answer, "their_caption": p["caption"]}
+
+
+async def zoom_last_photo(client: httpx.AsyncClient, region: str = "center", zoom: int = 2, question: str = "") -> dict:
+    """Look closely at one part of the latest photo, at its full resolution: for small text, markings, parts."""
+    p = photos.last_photo()
+    if not p:
+        raise LookupError("no photo in the last 10 minutes; ask Rocky to take one, or send one to the Telegram bot")
+    region = region if region in photos.ZOOM_REGIONS else "center"
+    answer = await photos.look(photos.crop(p["jpeg"], region, int(zoom or 2)),
+                               (question or "Describe this close-up in detail.") + f" (This is a zoomed-in close-up "
+                               f"of the {region} part of the photo.)")
+    return {"region": region, "zoom": zoom, "close_up": answer}
 
 
 async def add_photo_item_to_shopping_list(client: httpx.AsyncClient) -> dict:
@@ -392,6 +404,18 @@ async def add_photo_item_to_shopping_list(client: httpx.AsyncClient) -> dict:
         raise LookupError("no photo in the last 10 minutes; the user can send one to the Telegram bot")
     name = await photos.item_name(p["jpeg"])
     return {"item": name, **shopping.add([name])}
+
+
+async def look_through_camera(client: httpx.AsyncClient, question: str = "") -> dict:
+    """Take a photo with the home camera and answer about it. A photo tool: tools off after it, answer not kept."""
+    from . import announce
+
+    if announce.quiet_now() and not settings.camera_in_quiet_hours:
+        raise RuntimeError("the camera is off during quiet hours")
+    jpeg = await photos.snapshot()
+    answer = await photos.look(jpeg, question or "What do you see in this room right now?")
+    photos.remember(jpeg, question, answer)
+    return {"camera_view": answer}
 
 
 # --- good-morning briefing ---
@@ -473,12 +497,23 @@ TOOLS = {
                                                    "time, today's weather, today's reminders, 2 world news, "
                                                    "shopping list size. Use it instead of the separate tools.", {}),
 }
-if settings.telegram_photos:
-    TOOLS["look_at_last_photo"] = (look_at_last_photo, "Look at the LATEST photo the user sent to the Telegram bot "
-                                   "(\"what's in the photo I sent?\"). The only way to know what's in it: photos change, "
-                                   "so never answer from earlier in the conversation.", {
+if settings.camera_url and settings.camera_token:
+    TOOLS["look_through_camera"] = (look_through_camera, "Take a NEW photo with the home camera and look at it: \"take a"
+                                    " photo\", \"what do you see?\", \"is the light on?\", \"is anyone there?\".", {
+        "question": {"type": "string", "description": "What they want to know; omit to describe what's there"}})
+if settings.telegram_photos or (settings.camera_url and settings.camera_token):
+    TOOLS["look_at_last_photo"] = (look_at_last_photo, "Look again at the LATEST photo, from the camera or sent to the "
+                                   "Telegram bot, without taking a new one (\"in that photo, what colour is...\", \"what's "
+                                   "in the photo I sent?\"). The only way to know what's in it: never answer from earlier "
+                                   "in the conversation.", {
         "question": {"type": "string", "description": "What they want to know; omit to just describe it"}})
-    TOOLS["add_photo_item_to_shopping_list"] = (add_photo_item_to_shopping_list, "Put the item shown in the LATEST photo "
+    TOOLS["zoom_last_photo"] = (zoom_last_photo, "Look closely at one part of the latest photo at full resolution, "
+                                "to read small text, part numbers, markings, colour bands, screws or wires (\"zoom on the"
+                                " chip on the left\"). Use after a look when details are too small.", {
+        "region": {"type": "string", "enum": photos.ZOOM_REGIONS},
+        "zoom": {"type": "integer", "enum": [2, 3], "description": "2 = a quarter of the photo, 3 = a ninth (closer)"},
+        "question": {"type": "string", "description": "What to look for in that part"}})
+    TOOLS["add_photo_item_to_shopping_list"] = (add_photo_item_to_shopping_list, "Put the item shown in the LATEST photo (camera or Telegram) "
                                                 "on the shopping list (\"add the thing in the photo to the list\"). It "
                                                 "looks at the photo itself: never guess the item.", {})
 _REQUIRED = {"calculate": ["expression"], "lookup_wikipedia": ["topic"], "set_reminder": ["text"], "set_alarm": ["at"],
@@ -492,13 +527,18 @@ def schemas() -> list[dict]:
         for name, (_fn, desc, props) in TOOLS.items()]
 
 
+# Tools that run the vision model (4-6 s), plus a camera capture (1.5-3 s): the default 8 s isn't enough.
+SLOW_TOOLS = {"look_through_camera": 45, "look_at_last_photo": 40, "add_photo_item_to_shopping_list": 40,
+              "zoom_last_photo": 40}
+
+
 async def run(client: httpx.AsyncClient, name: str, arguments: str) -> str:
     """Run one tool call; always returns a JSON string (errors included) for the model."""
     t0 = time.monotonic()
     try:
         fn = TOOLS[name][0]
         args = json.loads(arguments or "{}")
-        result = await asyncio.wait_for(fn(client, **args), timeout=HTTP_TIMEOUT_S + 2)
+        result = await asyncio.wait_for(fn(client, **args), timeout=SLOW_TOOLS.get(name, HTTP_TIMEOUT_S + 2))
     except Exception as e:  # anything a tool raises becomes a message the model can speak around
         logger.warning("tool %s(%s) failed: %r", name, arguments, e)
         result = {"error": f"{type(e).__name__}: {e}"}

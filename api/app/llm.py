@@ -15,7 +15,7 @@ import time
 
 import httpx
 
-from . import tools
+from . import photos, tools
 from .config import settings
 
 logger = logging.getLogger("uvicorn.error")
@@ -43,13 +43,32 @@ _WEATHER_TOOLS = {"get_weather", "get_morning_briefing"}
 _WEATHER_ASK = re.compile(r"\b(weather|run|walk|beach|laundry|jacket|coat|umbrella|outside|cold|hot|warm|rain\w*|"
                           r"sun\w*|bike|hike|picnic|terrace)\b", re.I)
 _DODGE = re.compile(r"\b(check|look|find out|cannot know|can't know|outside)\b", re.I)
-PHOTO_TOOLS = {"look_at_last_photo", "add_photo_item_to_shopping_list"}  # their results come from a photo
+PHOTO_TOOLS = {"look_at_last_photo", "add_photo_item_to_shopping_list", "look_through_camera", "zoom_last_photo"}
+# Once a photo's content is in the turn, only these stay available: they only look (no setting, sending, changing).
+READ_ONLY_PHOTO_TOOLS = {"look_at_last_photo", "zoom_last_photo"}
+# "Take a photo" / "what do you see?" always means a NEW photo: left to the model it sometimes reused one from minutes
+# ago. So the API takes it before the model answers (questions about "that photo" still reuse the last one).
+# ...unless it's about a picture already taken: "what do you see on the last photo?" took a new one (seen in use).
+# Then the API looks at the latest photo itself instead (only if there is one; otherwise the model decides).
+_LAST_PHOTO_REF = re.compile(r"\b(last|that|previous|earlier|same|the) (photo|picture|pic|image|shot)\b|"
+                             r"\b(photo|picture|pic|image) (i|you) (sent|took)\b|[uú]ltima foto|esa foto", re.I)
+_CAMERA_ASK = re.compile(r"\b(what (do|can) you see|take (a|another|one more) (photo|picture|pic|shot)|look around|"
+                         r"look at the room|qu[eé] ves|haz(me)? una foto)\b", re.I)
 
 # Recent exchanges as (time, messages of that turn). One speaker, one conversation, so module state is enough.
 # The turn's tool calls and (trimmed) results are kept too: with only the final answers in the history, the model
 # copies them and starts claiming "timer set" without calling set_timer.
 _history: list[tuple[float, list[dict]]] = []
 HISTORY_TOOL_RESULT_CHARS = 400
+
+
+def _photo_only(payload: dict) -> None:
+    """Keep only the read-only photo tools (or none): text in a photo must never be able to trigger an action."""
+    kept = [t for t in payload.get("tools", []) if t["function"]["name"] in READ_ONLY_PHOTO_TOOLS]
+    if kept:
+        payload["tools"] = kept
+    else:
+        payload.pop("tools", None)
 
 
 def _recent() -> list[dict]:
@@ -101,6 +120,24 @@ async def _chat(user_text: str, from_user: bool = True) -> tuple[str, list[dict]
     headers = {"Authorization": f"Bearer {settings.llm_api_key}"}
 
     async with httpx.AsyncClient(timeout=settings.llm_timeout_s) as client:
+        refers_back = bool(_LAST_PHOTO_REF.search(user_text))
+        if from_user and "look_through_camera" in tools.TOOLS and _CAMERA_ASK.search(user_text) and not refers_back:
+            auto = "look_through_camera"          # "take a photo" / "what do you see?": a NEW photo
+        elif from_user and refers_back and "look_at_last_photo" in tools.TOOLS and photos.last_photo():
+            auto = "look_at_last_photo"           # "...on the last photo?": the one already taken
+        else:
+            auto = None
+        if auto:
+            args = json.dumps({"question": user_text})
+            call = {"id": "auto_photo", "type": "function", "function": {"name": auto, "arguments": args}}
+            result = await tools.run(client, auto, args)
+            messages.extend([{"role": "assistant", "content": "", "tool_calls": [call]},
+                             {"role": "tool", "tool_call_id": "auto_photo", "content": result}])
+            turn.extend([{"role": "assistant", "content": "", "tool_calls": [call]},
+                         {"role": "tool", "tool_call_id": "auto_photo", "content": "(photo answer not kept)"}])
+            _photo_only(payload)  # a photo's content came from outside: from here on, only looking
+            used_tool = True
+            used_names.add(auto)
         for round_ in range(MAX_TOOL_ROUNDS + 1):
             if round_ == MAX_TOOL_ROUNDS:
                 payload.pop("tools", None)  # last round: force a spoken answer from what it has
@@ -111,7 +148,7 @@ async def _chat(user_text: str, from_user: bool = True) -> tuple[str, list[dict]
             if not calls:
                 reply = (message.get("content") or "").strip()
                 if (from_user and "tools" in payload and "get_weather" in tools.TOOLS and not fetched_weather
-                        and not used_names & _WEATHER_TOOLS
+                        and not used_names & _WEATHER_TOOLS and not used_names & PHOTO_TOOLS
                         and (_WEATHER_FACT.search(reply) or (_WEATHER_ASK.search(user_text) and _DODGE.search(reply)))):
                     fetched_weather = True
                     logger.info("weather answered without the tool, fetching it: %r", reply)
@@ -144,9 +181,9 @@ async def _chat(user_text: str, from_user: bool = True) -> tuple[str, list[dict]
             step += [{"role": "tool", "tool_call_id": c.get("id", ""), "content": r} for c, r in zip(calls, results)]
             messages.extend(step)
             if any(c["function"]["name"] in PHOTO_TOOLS for c in calls):
-                # A photo's content came from outside: from here on this turn can only talk, not act, and what the
-                # photo said isn't kept for later turns (which have tools).
-                payload.pop("tools", None)
+                # A photo's content came from outside: from here on this turn can only look (zoom), not act, and
+                # what the photo said isn't kept for later turns (which have tools).
+                _photo_only(payload)
                 step = [dict(m, content="(photo answer not kept)") if m["role"] == "tool" else m for m in step]
             turn.extend(step)
 

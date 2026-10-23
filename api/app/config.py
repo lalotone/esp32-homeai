@@ -93,7 +93,9 @@ class Settings:
         " (send_to_phone, send_shopping_list, or set_reminder with to_phone): only when asked, and say it's sent"
         " only if the tool succeeded. When asked what song is playing, always call identify_song first. You only know"
         " what's in the user's latest photo by calling look_at_last_photo (or add_photo_item_to_shopping_list to put it"
-        " on the list): never from earlier in the conversation, the photo may have changed. For the homelab (the user's home Kubernetes cluster), say in plain words if all is fine"
+        " on the list): never from earlier in the conversation, the photo may have changed. \"Take a photo\" or \"what"
+        " do you see?\" means look_through_camera (a NEW photo); questions about that picture afterwards use"
+        " look_at_last_photo. For the homelab (the user's home Kubernetes cluster), say in plain words if all is fine"
         " and mention only real problems, GPU temperatures and free disk. You cannot do lights or music: say so"
         " simply. Never pretend or "
         "promise to do things you cannot do. Reply ONLY with the words to speak aloud: no stage directions, "
@@ -135,6 +137,11 @@ class Settings:
     # empty = never quiet). Quiet hours only affect these, not alarms or timers.
     photo_answers_on_speaker: bool = _get("PHOTO_ANSWERS_ON_SPEAKER", "true").lower() == "true"
     quiet_hours: str = _get("QUIET_HOURS", "23-8")
+    # A camera Rocky can look through on request (e.g. a Raspberry Pi running rocky-cam): its snapshot URL and token.
+    # Empty URL = no camera tool. By default it doesn't look during QUIET_HOURS.
+    camera_url: str = _get("CAMERA_URL", "")
+    camera_token: str = _get("CAMERA_TOKEN", "")
+    camera_in_quiet_hours: bool = _get("CAMERA_IN_QUIET_HOURS", "false").lower() == "true"
 
     # --- STT (faster-whisper) ---
     whisper_model: str = _get("WHISPER_MODEL", "base")
