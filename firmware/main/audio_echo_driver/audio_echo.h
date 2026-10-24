@@ -25,7 +25,8 @@ esp_err_t audio_capture_mono(int seconds, int16_t **out_buf, int *out_frames);
 esp_err_t audio_capture_vad(int16_t **out_buf, int *out_frames);
 
 // Same, for a follow-up question: gives up after `start_timeout_ms` if nobody
-// starts talking (0 = wait the whole VAD_MAX_SECONDS), and only counts speech
+// starts talking (0 = wait the whole VAD_MAX_SECONDS; a timeout may be longer:
+// only the last moment before the speech is kept), and only counts speech
 // as started after `min_speech_chunks` consecutive loud 32 ms chunks, so a
 // click or the tail of the speaker's own reply doesn't open a turn.
 // *out_heard says whether speech started; the buffer is returned either way.

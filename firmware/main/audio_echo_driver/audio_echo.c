@@ -4,6 +4,8 @@
 #include "mic_speech.h"
 #include "led_ring.h"
 
+#include <string.h>
+
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -26,6 +28,10 @@ static const char *TAG = "audio_echo";
 // normal speech rms_sq ~15000+ (rms ~120-160). 60 (rms_sq 3600) sits well above
 // the floor and below speech; re-tune if the mic or room changes.
 #define VAD_SILENCE_RMS     60
+// While a follow-up waits for someone to start talking, only this much audio from before the first loud chunk is
+// kept (the start of the first word), so the wait can be longer than VAD_MAX_SECONDS without eating into the
+// question's own 10 s.
+#define VAD_PREROLL_MS      500
 
 esp_err_t audio_capture_mono(int seconds, int16_t **out_buf, int *out_frames)
 {
@@ -111,9 +117,12 @@ esp_err_t audio_capture_vad_wait(int start_timeout_ms, int min_speech_chunks, in
     ESP_LOGI(TAG, "VAD capture (max %ds)...", VAD_MAX_SECONDS);
 
     int frames_captured = 0;
+    int frames_waited = 0;    // before speech started (the follow-up window)
+    int preroll_frames = AUDIO_CAPTURE_SAMPLE_RATE * VAD_PREROLL_MS / 1000;
     int silence_run = 0;      // consecutive low-RMS samples once speech has started
     int loud_run = 0;         // consecutive loud chunks before speech counts as started
     bool started = false;     // have we seen the user actually start talking?
+    int frames_read = 0;      // everything read, kept or not (for the log)
     int log_next = AUDIO_CAPTURE_SAMPLE_RATE / 2; // log measured RMS ~every 500ms while tuning
 
     while (frames_captured < max_frames) {
@@ -142,10 +151,18 @@ esp_err_t audio_capture_vad_wait(int start_timeout_ms, int min_speech_chunks, in
             mono_buf[frames_captured + i] = chunk_buf[i * feed_channels + MIC_CHANNEL_INDEX];
         }
         frames_captured += RECORD_CHUNK_FRAMES;
+        frames_read += RECORD_CHUNK_FRAMES;
+        if (!started) {
+            frames_waited += RECORD_CHUNK_FRAMES;
+            if (start_timeout_frames > 0 && frames_captured > preroll_frames + RECORD_CHUNK_FRAMES) {
+                memmove(mono_buf, mono_buf + frames_captured - preroll_frames, (size_t)preroll_frames * sizeof(int16_t));
+                frames_captured = preroll_frames;  // keep just the pre-roll while nobody is talking
+            }
+        }
 
-        if (frames_captured >= log_next) {
+        if (frames_read >= log_next) {
             ESP_LOGI(TAG, "VAD: %dms rms_sq=%lld started=%d",
-                     frames_captured * 1000 / AUDIO_CAPTURE_SAMPLE_RATE,
+                     frames_read * 1000 / AUDIO_CAPTURE_SAMPLE_RATE,
                      (long long)rms_sq, (int)started);
             log_next += AUDIO_CAPTURE_SAMPLE_RATE / 2;
         }
@@ -159,15 +176,15 @@ esp_err_t audio_capture_vad_wait(int start_timeout_ms, int min_speech_chunks, in
             break;
         }
         // Follow-up window: nobody started talking in time, so give up early.
-        if (!started && start_timeout_frames > 0 && frames_captured >= start_timeout_frames) {
+        if (!started && start_timeout_frames > 0 && frames_waited >= start_timeout_frames) {
             break;
         }
     }
     *out_heard = started;
 
     if (!started) {
-        ESP_LOGI(TAG, "VAD: no speech detected (%dms of silence captured)",
-                 frames_captured * 1000 / AUDIO_CAPTURE_SAMPLE_RATE);
+        ESP_LOGI(TAG, "VAD: no speech detected (%dms of silence)",
+                 frames_waited * 1000 / AUDIO_CAPTURE_SAMPLE_RATE);
     }
 
     free(chunk_buf);

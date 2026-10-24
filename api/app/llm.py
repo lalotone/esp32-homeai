@@ -86,16 +86,22 @@ def _remember(turn: list[dict]) -> None:
     del _history[:-settings.history_turns]
 
 
-async def chat(user_text: str, from_user: bool = True) -> str:
+async def chat(user_text: str, from_user: bool = True, look: bool = False) -> str:
     """Send one user turn and return the assistant's reply text. from_user=False for prompts the API composes itself
-    (alarm briefings, song results): they aren't requests, so the no-tool-call check doesn't apply."""
-    reply, turn = await _chat(user_text, from_user)
+    (alarm briefings, song results): they aren't requests, so the no-tool-call check doesn't apply. look=True (Live
+    View): the answer gets a fresh camera photo, as if they'd asked "what do you see?"."""
+    reply, turn = await _chat(user_text, from_user, look)
     if reply:
         _remember(turn)
     return reply
 
 
-async def _chat(user_text: str, from_user: bool = True) -> tuple[str, list[dict]]:
+def note(user_text: str, reply: str) -> None:
+    """Something Rocky said on his own (a Live View warning), so a follow-up question knows about it."""
+    _remember([{"role": "user", "content": user_text}, {"role": "assistant", "content": reply}])
+
+
+async def _chat(user_text: str, from_user: bool = True, look: bool = False) -> tuple[str, list[dict]]:
     """The reply, and this turn's messages (user, tool calls/results, final answer) for the history."""
     url = settings.llm_base_url.rstrip("/") + "/chat/completions"
     turn = [{"role": "user", "content": user_text}]
@@ -121,14 +127,17 @@ async def _chat(user_text: str, from_user: bool = True) -> tuple[str, list[dict]
 
     async with httpx.AsyncClient(timeout=settings.llm_timeout_s) as client:
         refers_back = bool(_LAST_PHOTO_REF.search(user_text))
-        if from_user and "look_through_camera" in tools.TOOLS and _CAMERA_ASK.search(user_text) and not refers_back:
+        if (from_user and "look_through_camera" in tools.TOOLS and (look or _CAMERA_ASK.search(user_text))
+                and not refers_back):
             auto = "look_through_camera"          # "take a photo" / "what do you see?": a NEW photo
         elif from_user and refers_back and "look_at_last_photo" in tools.TOOLS and photos.last_photo():
             auto = "look_at_last_photo"           # "...on the last photo?": the one already taken
         else:
             auto = None
         if auto:
-            args = json.dumps({"question": user_text})
+            # Live View: a look per question, so only the essentials (a 120-word description takes ~5 s to write).
+            brief = " (Answer in under 60 words: just what matters for this.)" if look else ""
+            args = json.dumps({"question": user_text + brief})
             call = {"id": "auto_photo", "type": "function", "function": {"name": auto, "arguments": args}}
             result = await tools.run(client, auto, args)
             messages.extend([{"role": "assistant", "content": "", "tool_calls": [call]},

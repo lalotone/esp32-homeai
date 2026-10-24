@@ -15,6 +15,7 @@ import json
 import logging
 import math
 import os
+import re
 import tempfile
 import wave
 from datetime import datetime
@@ -27,7 +28,7 @@ from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 from starlette.concurrency import run_in_threadpool
 
-from . import alerts, announce, llm, photos, songs, stt, telegram, tools, tts
+from . import alerts, announce, live, llm, photos, songs, stt, telegram, tools, tts
 from .config import settings
 
 logger = logging.getLogger("uvicorn.error")
@@ -138,6 +139,23 @@ async def start_alarm_loop() -> None:
     asyncio.get_running_loop().create_task(_alarm_loop())
 
 
+@app.on_event("startup")
+async def start_live_view() -> None:
+    asyncio.get_running_loop().create_task(live.watch_loop(_busy.locked))
+
+
+@app.get("/live/next")
+async def live_next() -> Response:
+    """Asked by the board between its listening slices in a Live View session: a warning Rocky prepared (WAV), 204
+    if there's none, 410 once Live View is off (the board then ends the session like a normal one)."""
+    if not live.active():
+        return Response(status_code=410)
+    wav_bytes = live.take_next()
+    if not wav_bytes:
+        return Response(status_code=204)
+    return Response(content=wav_bytes, media_type="audio/wav")
+
+
 @app.get("/pending")
 async def pending() -> Response:
     """Polled by the ESP32 while idle: Rocky's announcement of a due timer/reminder as a WAV, or 204 if none.
@@ -211,6 +229,17 @@ def _silence_wav(seconds: float) -> bytes:
     return out.getvalue()
 
 
+# Conversation sessions: after the wake word the board keeps listening, turn after turn, until the user goes quiet
+# or says goodbye ("bye bye", "goodbye, Rocky", "good night"). Rocky still answers a goodbye (in his own words); the
+# X-Session: end header tells the board to close the mic and go back to the wake word. Only a short utterance
+# counts, so "how do you say bye in Spanish?" is a question, not a goodbye.
+_GOODBYE = re.compile(r"\b(?:bye|byebye|goodbye|good night)\b", re.I)
+
+
+def _is_goodbye(transcript: str) -> bool:
+    return len(transcript.split()) <= 6 and bool(_GOODBYE.search(transcript.replace("-", " ")))
+
+
 def _silence_response() -> Response:
     """The "woke but said nothing" reply: a silent WAV + marker headers."""
     return Response(
@@ -220,6 +249,7 @@ def _silence_response() -> Response:
             # URL-encoded so non-ASCII text can't break the header.
             "X-Transcript": quote(""),
             "X-Reply": quote("silence"),
+            "X-Live": "on" if live.active() else "off",  # a noise in Live View doesn't end the session
         },
     )
 
@@ -278,12 +308,20 @@ async def _talk(request: Request, audio: UploadFile | None) -> Response:
 
         if songs.is_request(transcript):
             songs.arm()  # the next recording is the music sample, whether or not the model calls identify_song
-        reply = await llm.chat(transcript)
+        # The board says whether this question follows an answer in a session, or comes right after the wake word
+        # (a new session: Live View starts off).
+        goodbye = _is_goodbye(transcript)
+        look = live.on_question(transcript, wake=request.headers.get("x-turn") != "follow") and not goodbye
+        reply = await llm.chat(transcript, look=look)
         wav_bytes = await run_in_threadpool(tts.synthesize, reply)
     finally:
         os.unlink(in_path)
 
     _talk_counts["answered"] += 1
+    live.answered()
+    if goodbye:
+        live.stop()
+        logger.info("Goodbye: ending the conversation session")
     return Response(
         content=wav_bytes,
         media_type="audio/wav",
@@ -291,5 +329,7 @@ async def _talk(request: Request, audio: UploadFile | None) -> Response:
             # URL-encoded so non-ASCII text can't break the header.
             "X-Transcript": quote(transcript),
             "X-Reply": quote(reply),
+            "X-Session": "end" if goodbye else "open",
+            "X-Live": "on" if live.active() else "off",  # Live View: the board listens longer, and asks for warnings
         },
     )

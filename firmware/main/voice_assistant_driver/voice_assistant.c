@@ -16,6 +16,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 
 static const char *TAG = "voice_assistant";
 
@@ -40,14 +41,23 @@ static const char *TAG = "voice_assistant";
 // announcement both need the mic paused and the DAC, so they never overlap.
 static SemaphoreHandle_t s_speaker_lock;
 
-// Follow-up mode: after each answer the mic stays open this long, so the user can keep
-// talking without the wake word (the API keeps the conversation's context). Silence in
-// that window, or an answer that is just the API's "nothing heard" blip, ends it.
-#define FOLLOWUP_WINDOW_MS      6000
-#define FOLLOWUP_MAX_TURNS      5     // follow-ups per wake, so a TV can't keep it talking forever
+// Conversation session: after the wake word the mic stays open after each answer, so the
+// user can keep talking without the wake word (the API keeps the conversation's context).
+// It ends on FOLLOWUP_WINDOW_MS of silence, an answer that is just the API's "nothing
+// heard" blip, or a goodbye ("bye bye": the API marks that answer X-Session: end).
+#define FOLLOWUP_WINDOW_MS      5000
+#define FOLLOWUP_MAX_TURNS      30    // per session, so a TV can't keep it talking forever
 #define FOLLOWUP_ECHO_GAP_MS    300   // let the speaker's last syllable die out before listening
 #define FOLLOWUP_MIN_SPEECH     3     // ~100 ms of speech to count (not a click or an echo tail)
 #define NOTHING_HEARD_MAX_S     1.0f  // the API answers silence with a ~0.4 s silent clip
+
+// Live View ("live view", "watch this"): the API answers each question with a fresh camera
+// photo and watches the bench in between. Working hands are quiet for a while, so the
+// session waits LIVE_WINDOW_MS; it listens in LIVE_SLICE_MS slices and, between them, asks
+// GET /live/next for a warning Rocky prepared (a part in backwards, smoke...).
+#define LIVE_WINDOW_MS          30000
+#define LIVE_SLICE_MS           3000
+#define LIVE_POLL_TIMEOUT_MS    3000
 
 #pragma pack(push, 1)
 typedef struct {
@@ -86,15 +96,40 @@ static void fill_wav_header(wav_header_t *h, uint32_t pcm_bytes)
 
 // POSTs `body` to `url` and reads the response body into a PSRAM buffer the
 // caller must free. Returns ESP_OK only on HTTP 200.
-static esp_err_t http_post_and_read(const char *url, const uint8_t *body, size_t body_len, uint8_t **out_resp, size_t *out_resp_len)
+// What the API says about the session along with an answer.
+typedef struct {
+    bool end;   // X-Session: end (the user said goodbye)
+    bool live;  // X-Live: on (Live View is on)
+} session_info_t;
+
+static esp_err_t session_header_handler(esp_http_client_event_t *evt)
+{
+    session_info_t *info = evt->user_data;
+    if (evt->event_id != HTTP_EVENT_ON_HEADER || !info) {
+        return ESP_OK;
+    }
+    if (strcasecmp(evt->header_key, "X-Session") == 0) {
+        info->end = strcasecmp(evt->header_value, "end") == 0;
+    } else if (strcasecmp(evt->header_key, "X-Live") == 0) {
+        info->live = strcasecmp(evt->header_value, "on") == 0;
+    }
+    return ESP_OK;
+}
+
+// `turn` ("wake" or "follow") tells the API whether this question starts a session.
+static esp_err_t http_post_and_read(const char *url, const char *turn, const uint8_t *body, size_t body_len,
+                                    uint8_t **out_resp, size_t *out_resp_len, session_info_t *out_info)
 {
     *out_resp = NULL;
     *out_resp_len = 0;
+    *out_info = (session_info_t){0};
 
     esp_http_client_config_t config = {
         .url = url,
         .method = HTTP_METHOD_POST,
         .timeout_ms = HTTP_TIMEOUT_MS,
+        .event_handler = session_header_handler,
+        .user_data = out_info,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {
@@ -102,6 +137,7 @@ static esp_err_t http_post_and_read(const char *url, const uint8_t *body, size_t
         return ESP_FAIL;
     }
     esp_http_client_set_header(client, "Content-Type", "audio/wav");
+    esp_http_client_set_header(client, "X-Turn", turn);
 
     esp_err_t err = esp_http_client_open(client, body_len);
     if (err != ESP_OK) {
@@ -266,6 +302,7 @@ static esp_err_t play_mono_pcm(const int16_t *mono, int frames)
 }
 
 static esp_err_t ask_locked(void);
+static void api_url(char *out, size_t out_size, const char *path);
 
 esp_err_t voice_assistant_ask(void)
 {
@@ -278,12 +315,69 @@ esp_err_t voice_assistant_ask(void)
     return ret;
 }
 
+// Plays a WAV reply (the LED blue meanwhile); the mic feed must be paused.
+static esp_err_t play_wav(const uint8_t *wav, size_t len)
+{
+    const uint8_t *pcm = NULL;
+    size_t pcm_len = 0;
+    find_pcm_payload(wav, len, &pcm, &pcm_len);
+    if (pcm_len < sizeof(int16_t)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    led_ring_set_color(0, 128, 255); // blue: playing back the response
+    return play_mono_pcm((const int16_t *)pcm, pcm_len / sizeof(int16_t));
+}
+
+// Waits for the next question in a session. Normally FOLLOWUP_WINDOW_MS; in Live View
+// LIVE_WINDOW_MS of quiet, in slices, playing any warning the API prepared in between (a
+// warning restarts the wait, so the user can answer it). *live turns false when the API
+// says Live View is over. *out_heard: someone started talking (the recording is in *out_buf).
+static esp_err_t wait_for_followup(bool *live, int16_t **out_buf, int *out_frames, bool *out_heard)
+{
+    if (!*live) {
+        return audio_capture_vad_wait(FOLLOWUP_WINDOW_MS, FOLLOWUP_MIN_SPEECH, out_buf, out_frames, out_heard);
+    }
+    char url[APP_CONFIG_URL_MAX_LEN];
+    api_url(url, sizeof(url), "/live/next");
+    int quiet_ms = 0;
+    while (true) {
+        led_ring_set_color(255, 96, 0); // amber: Live View, listening (and the camera watching)
+        esp_err_t ret = audio_capture_vad_wait(LIVE_SLICE_MS, FOLLOWUP_MIN_SPEECH, out_buf, out_frames, out_heard);
+        if (ret != ESP_OK || *out_heard) {
+            return ret;
+        }
+        free(*out_buf);
+        *out_buf = NULL;
+        quiet_ms += LIVE_SLICE_MS;
+        if (quiet_ms >= (*live ? LIVE_WINDOW_MS : FOLLOWUP_WINDOW_MS)) {
+            return ESP_OK; // nobody spoke: the session ends
+        }
+        int status = 0;
+        uint8_t *resp = NULL;
+        size_t resp_len = 0;
+        if (http_get_and_read(url, LIVE_POLL_TIMEOUT_MS, &status, &resp, &resp_len) != ESP_OK) {
+            continue; // the API is unreachable for a moment: keep listening
+        }
+        if (status == 410) {
+            *live = false; // Live View is over: the normal window from here
+        } else if (resp) {
+            ESP_LOGI(TAG, "Live View: Rocky has something to say");
+            play_wav(resp, resp_len);
+            quiet_ms = 0;
+            vTaskDelay(pdMS_TO_TICKS(FOLLOWUP_ECHO_GAP_MS));
+        }
+        free(resp);
+    }
+}
+
 // One question and its answer. A follow-up turn only listens for FOLLOWUP_WINDOW_MS and
 // uploads nothing if the user stays quiet. *out_answered: a real answer was played (so a
-// further follow-up makes sense).
-static esp_err_t one_turn(bool followup, bool *out_answered)
+// further follow-up makes sense). *out_end: the user said goodbye, the session is over.
+// *live: Live View is on (in: for the wait; out: what the API says after this answer).
+static esp_err_t one_turn(bool followup, bool *out_answered, bool *out_end, bool *live)
 {
     *out_answered = false;
+    *out_end = false;
     int16_t *mono_buf = NULL;
     int total_frames = 0;
     esp_err_t ret;
@@ -292,7 +386,7 @@ static esp_err_t one_turn(bool followup, bool *out_answered)
     if (followup) {
         vTaskDelay(pdMS_TO_TICKS(FOLLOWUP_ECHO_GAP_MS));
         bool heard = false;
-        ret = audio_capture_vad_wait(FOLLOWUP_WINDOW_MS, FOLLOWUP_MIN_SPEECH, &mono_buf, &total_frames, &heard);
+        ret = wait_for_followup(live, &mono_buf, &total_frames, &heard);
         if (ret == ESP_OK && !heard) {
             ESP_LOGI(TAG, "No follow-up: back to the wake word");
             free(mono_buf);
@@ -341,8 +435,11 @@ static esp_err_t one_turn(bool followup, bool *out_answered)
 
     uint8_t *resp_buf = NULL;
     size_t resp_len = 0;
-    ret = http_post_and_read(url, wav_buf, wav_len, &resp_buf, &resp_len);
+    session_info_t info;
+    ret = http_post_and_read(url, followup ? "follow" : "wake", wav_buf, wav_len, &resp_buf, &resp_len, &info);
     free(wav_buf);
+    *out_end = info.end;
+    *live = info.live;
 
     if (ret != ESP_OK) {
         mic_speech_pause_feed(false);
@@ -379,7 +476,9 @@ static esp_err_t one_turn(bool followup, bool *out_answered)
 
     mic_speech_pause_feed(false);
     led_ring_off();
-    *out_answered = resp_frames / (float)AUDIO_CAPTURE_SAMPLE_RATE > NOTHING_HEARD_MAX_S;
+    // A real answer keeps the session going; in Live View even the "nothing heard" blip does (a
+    // noise at the bench), the silence window still ends it.
+    *out_answered = resp_frames / (float)AUDIO_CAPTURE_SAMPLE_RATE > NOTHING_HEARD_MAX_S || *live;
     ESP_LOGI(TAG, "Done");
     return ESP_OK;
 }
@@ -390,18 +489,21 @@ static esp_err_t ask_locked(void)
         ESP_LOGW(TAG, "WiFi not connected, skipping");
         return ESP_ERR_INVALID_STATE;
     }
-    bool answered = false;
-    esp_err_t ret = one_turn(false, &answered);
-    for (int i = 0; ret == ESP_OK && answered && i < FOLLOWUP_MAX_TURNS; i++) {
-        ESP_LOGI(TAG, "Listening for a follow-up (%d/%d)...", i + 1, FOLLOWUP_MAX_TURNS);
-        ret = one_turn(true, &answered);
+    bool answered = false, end = false, live = false;
+    esp_err_t ret = one_turn(false, &answered, &end, &live);
+    for (int i = 0; ret == ESP_OK && answered && !end && i < FOLLOWUP_MAX_TURNS; i++) {
+        ESP_LOGI(TAG, "Listening for a follow-up (%d/%d)%s...", i + 1, FOLLOWUP_MAX_TURNS, live ? ", Live View" : "");
+        ret = one_turn(true, &answered, &end, &live);
+    }
+    if (end) {
+        ESP_LOGI(TAG, "Goodbye: back to the wake word");
     }
     return ret;
 }
 
-// The announcement URL is the /talk URL with "/talk" swapped for "/pending"
-// (or "/pending" appended to the URL's directory if it doesn't end in /talk).
-static void pending_url(char *out, size_t out_size)
+// API URLs are the /talk URL with "/talk" swapped for `path` (e.g. "/pending")
+// (or `path` appended to the URL's directory if it doesn't end in /talk).
+static void api_url(char *out, size_t out_size, const char *path)
 {
     char talk[APP_CONFIG_URL_MAX_LEN];
     app_config_get_llm_url(talk, sizeof(talk));
@@ -411,7 +513,7 @@ static void pending_url(char *out, size_t out_size)
     if (slash) {
         *slash = '\0';
     }
-    snprintf(out, out_size, "%s/pending", talk);
+    snprintf(out, out_size, "%s%s", talk, path);
 }
 
 static void announce_task(void *arg)
@@ -423,7 +525,7 @@ static void announce_task(void *arg)
         if (!wifi_conn_is_connected() || xSemaphoreTake(s_speaker_lock, 0) != pdTRUE) {
             continue; // offline, or a question is in progress: try on the next tick
         }
-        pending_url(url, sizeof(url));
+        api_url(url, sizeof(url), "/pending");
         int status = 0;
         uint8_t *resp = NULL;
         size_t resp_len = 0;
