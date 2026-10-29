@@ -33,6 +33,9 @@ _CLAIM = re.compile(r"\b(set|added|sent|cancel+ed|removed|cleared|done|ready|on 
 _NUDGE = ("[Check: you called no tool, so nothing was set, added, sent or cancelled. If this request needs a tool, "
           "call it now. If you really must ask the user something first, reply with only that question.]")
 _DIDNT_WORK = "Hmm, Rocky could not do that. Say it again, question?"
+# A tool call the server couldn't parse comes back as the reply's text (seen with Gemma 4 after a failed call:
+# "<|tool_call>call:calculate{...}"). Never spoken: the round is asked again once, then _DIDNT_WORK.
+_MARKUP = re.compile(r"<\|?/?tool_call|<\|\"\|>|\bcall:\w+\{")
 # A reply about the weather with no weather tool this turn is invented or an unkept "I check" (seen: "Rain tonight, so
 # run bad" with no lookup). Nudging the model doesn't fix it reliably, so the API fetches the weather itself and asks
 # again with the real data.
@@ -46,6 +49,8 @@ _DODGE = re.compile(r"\b(check|look|find out|cannot know|can't know|outside)\b",
 PHOTO_TOOLS = {"look_at_last_photo", "add_photo_item_to_shopping_list", "look_through_camera", "zoom_last_photo"}
 # Once a photo's content is in the turn, only these stay available: they only look (no setting, sending, changing).
 READ_ONLY_PHOTO_TOOLS = {"look_at_last_photo", "zoom_last_photo"}
+# Tools whose results come from outside (a photo, a web page): after one, the turn can't act, and the result isn't kept.
+UNTRUSTED_TOOLS = PHOTO_TOOLS | {"web_search"}
 # "Take a photo" / "what do you see?" always means a NEW photo: left to the model it sometimes reused one from minutes
 # ago. So the API takes it before the model answers (questions about "that photo" still reuse the last one).
 # ...unless it's about a picture already taken: "what do you see on the last photo?" took a new one (seen in use).
@@ -101,6 +106,13 @@ def note(user_text: str, reply: str) -> None:
     _remember([{"role": "user", "content": user_text}, {"role": "assistant", "content": reply}])
 
 
+def recent_lines(n: int = 6) -> str:
+    """The last few spoken lines of the conversation, as plain text: context for an isolated look (no tool data)."""
+    lines = [f"{'User' if m['role'] == 'user' else 'Rocky'}: {m['content']}" for m in _recent()
+             if m["role"] in ("user", "assistant") and m.get("content")]
+    return "\n".join(lines[-n:])
+
+
 async def _chat(user_text: str, from_user: bool = True, look: bool = False) -> tuple[str, list[dict]]:
     """The reply, and this turn's messages (user, tool calls/results, final answer) for the history."""
     url = settings.llm_base_url.rstrip("/") + "/chat/completions"
@@ -116,7 +128,7 @@ async def _chat(user_text: str, from_user: bool = True, look: bool = False) -> t
     if settings.tools_enabled:
         payload["tools"] = tools.schemas()
     action = from_user and settings.tools_enabled and bool(_ACTION.search(user_text))
-    used_tool = nudged = False
+    used_tool = nudged = retried = False
     used_names: set[str] = set()
     fetched_weather = False
     if settings.llm_enable_thinking:
@@ -156,8 +168,14 @@ async def _chat(user_text: str, from_user: bool = True, look: bool = False) -> t
             calls = message.get("tool_calls") or []
             if not calls:
                 reply = (message.get("content") or "").strip()
+                if _MARKUP.search(reply):
+                    logger.warning("tool markup in the reply%s: %r", "" if retried else ", asking again", reply)
+                    if not retried:
+                        retried = True
+                        continue
+                    reply = _DIDNT_WORK
                 if (from_user and "tools" in payload and "get_weather" in tools.TOOLS and not fetched_weather
-                        and not used_names & _WEATHER_TOOLS and not used_names & PHOTO_TOOLS
+                        and not used_names & _WEATHER_TOOLS and not used_names & UNTRUSTED_TOOLS
                         and (_WEATHER_FACT.search(reply) or (_WEATHER_ASK.search(user_text) and _DODGE.search(reply)))):
                     fetched_weather = True
                     logger.info("weather answered without the tool, fetching it: %r", reply)
@@ -189,11 +207,15 @@ async def _chat(user_text: str, from_user: bool = True, look: bool = False) -> t
                                              for c in calls))
             step += [{"role": "tool", "tool_call_id": c.get("id", ""), "content": r} for c, r in zip(calls, results)]
             messages.extend(step)
-            if any(c["function"]["name"] in PHOTO_TOOLS for c in calls):
-                # A photo's content came from outside: from here on this turn can only look (zoom), not act, and
-                # what the photo said isn't kept for later turns (which have tools).
-                _photo_only(payload)
-                step = [dict(m, content="(photo answer not kept)") if m["role"] == "tool" else m for m in step]
+            if any(c["function"]["name"] in UNTRUSTED_TOOLS for c in calls):
+                # A photo's or a web page's content came from outside: from here on this turn can't act (after a
+                # photo it can still look again or zoom; after a web search, nothing: the photo tools only confused
+                # it), and what it said isn't kept for later turns (which have tools).
+                if used_names & PHOTO_TOOLS:
+                    _photo_only(payload)
+                else:
+                    payload.pop("tools", None)
+                step = [dict(m, content="(photo or web answer not kept)") if m["role"] == "tool" else m for m in step]
             turn.extend(step)
 
     return "", turn

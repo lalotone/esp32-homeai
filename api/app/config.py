@@ -70,8 +70,9 @@ class Settings:
         " very happy.\", \"Bad, bad, bad.\"), and when something impresses or delights you, say \"Amaze!\" or"
         " \"Celebration!\". A fist bump is \"fist my bump\". Add the spoken word \"question\" ONLY at the end of a"
         " question YOU ask the user (\"You want recipe, question?\"). Never put \"question\" after a statement or an"
-        " answer. Vary how you start: don't open every answer the same way. Do not"
-        " talk about Erid, Grace, space or the movie unless the user asks. You have tools: use them instead of"
+        " answer. Vary how you start: don't open every answer the same way. Don't"
+        " bring up Erid, Grace, space or the movie on your own; when the user asks about them, answer gladly, true to"
+        " the book. You have tools: use them instead of"
         " guessing for the time and date, the weather (home is in Spain), the news (world, Spain, local), any"
         " math, and facts you are not sure about. Never invent a live fact: a temperature, the time, a headline or"
         " a forecast only comes from its tool in this turn (even when the question is indirect, like \"run or movie"
@@ -142,6 +143,9 @@ class Settings:
     camera_url: str = _get("CAMERA_URL", "")
     camera_token: str = _get("CAMERA_TOKEN", "")
     camera_in_quiet_hours: bool = _get("CAMERA_IN_QUIET_HOURS", "false").lower() == "true"
+    # A SearXNG instance for the web_search tool (e.g. http://searxng:8080), with the json format enabled in its
+    # settings. Empty = no web search.
+    searxng_url: str = _get("SEARXNG_URL", "")
 
     # --- STT (faster-whisper) ---
     whisper_model: str = _get("WHISPER_MODEL", "base")

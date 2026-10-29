@@ -162,15 +162,16 @@ async def item_name(jpeg: bytes) -> str:
 _camera = asyncio.Lock()   # one photo at a time (a question's and Live View's watcher's)
 
 
-async def snapshot() -> bytes:
-    """One fresh photo from the camera (CAMERA_URL), sanitized like the Telegram ones."""
+async def snapshot(small: bool = False) -> bytes:
+    """One fresh photo from the camera (CAMERA_URL), sanitized like the Telegram ones. small=True: half resolution
+    (1296x972), ~1 s faster from the camera and over WiFi, for Live View (less to zoom into)."""
     # Errors are re-raised generic on purpose: httpx/h11 messages can include the request headers, i.e. the token
     # (seen once: "Illegal header value b'Bearer ...'"), and these messages reach the logs and the LLM.
     async with _camera:
         try:
             async with httpx.AsyncClient(timeout=20) as client:
                 for _ in range(2):
-                    resp = await client.get(settings.camera_url,
+                    resp = await client.get(settings.camera_url, params={"size": "small"} if small else None,
                                             headers={"Authorization": f"Bearer {settings.camera_token.strip()}"})
                     if resp.status_code != 429:
                         break

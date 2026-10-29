@@ -312,7 +312,7 @@ async def _talk(request: Request, audio: UploadFile | None) -> Response:
         # (a new session: Live View starts off).
         goodbye = _is_goodbye(transcript)
         look = live.on_question(transcript, wake=request.headers.get("x-turn") != "follow") and not goodbye
-        reply = await llm.chat(transcript, look=look)
+        reply = (await live.answer(transcript) if look else None) or await llm.chat(transcript, look=look)
         wav_bytes = await run_in_threadpool(tts.synthesize, reply)
     finally:
         os.unlink(in_path)

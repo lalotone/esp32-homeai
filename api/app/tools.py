@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-from . import alerts, photos, shopping, songs, telegram
+from . import alerts, photos, shopping, songs, telegram, websearch
 from .config import settings
 
 logger = logging.getLogger("uvicorn.error")
@@ -192,6 +192,8 @@ def _eval(node):
 
 
 async def calculate(client: httpx.AsyncClient, expression: str) -> dict:
+    if not isinstance(expression, str):  # Gemma 4 sometimes leaves it unquoted: llama.cpp read 240*0.17 as 0.17240
+        raise ValueError('the expression must be a quoted string, like "240 * 0.17"')
     value = _eval(ast.parse(expression.replace("^", "**"), mode="eval").body)
     if isinstance(value, float):
         value = round(value, 6)
@@ -408,14 +410,25 @@ async def add_photo_item_to_shopping_list(client: httpx.AsyncClient) -> dict:
 
 async def look_through_camera(client: httpx.AsyncClient, question: str = "") -> dict:
     """Take a photo with the home camera and answer about it. A photo tool: tools off after it, answer not kept."""
-    from . import announce
+    from . import announce, live
 
     if announce.quiet_now() and not settings.camera_in_quiet_hours:
         raise RuntimeError("the camera is off during quiet hours")
-    jpeg = await photos.snapshot()
-    answer = await photos.look(jpeg, question or "What do you see in this room right now?")
+    if live.active():  # a smaller photo (maybe the watcher's, seconds old) and a smaller look: faster
+        jpeg, side = await live.photo(), live.ASK_SIDE
+    else:
+        jpeg, side = await photos.snapshot(), photos.VISION_SIDE
+    answer = await photos.look(jpeg, question or "What do you see in this room right now?", side=side)
     photos.remember(jpeg, question, answer)
     return {"camera_view": answer}
+
+
+# --- web search ---
+
+async def web_search(client: httpx.AsyncClient, query: str, send_to_phone: bool = False) -> dict:
+    """Search the web and read the top pages (websearch.py). Untrusted content: tools off after it, notes not kept.
+    send_to_phone is done inside the tool, since no action tool is available after a search."""
+    return await websearch.answer(query, to_phone=bool(send_to_phone))
 
 
 # --- good-morning briefing ---
@@ -501,6 +514,16 @@ if settings.camera_url and settings.camera_token:
     TOOLS["look_through_camera"] = (look_through_camera, "Take a NEW photo with the home camera and look at it: \"take a"
                                     " photo\", \"what do you see?\", \"is the light on?\", \"is anyone there?\".", {
         "question": {"type": "string", "description": "What they want to know; omit to describe what's there"}})
+if settings.searxng_url:
+    TOOLS["web_search"] = (web_search, "Search the web and read the top pages, like a person would: open questions, "
+                           "recommendations, comparisons, travel ideas (\"what can I see near Paris\"), how-tos, "
+                           "products, anything recent or too specific for an encyclopedia. Takes a few seconds. Not for "
+                           "the time, weather or news (they have their own tools); for a quick fact about a well-known "
+                           "person, place or thing, lookup_wikipedia is faster. To send the results to the phone, "
+                           "use its send_to_phone option (no other tool can be used after a search).", {
+        "query": {"type": "string", "description": "What to search for, as you'd type it in a search engine"},
+        "send_to_phone": {"type": "boolean", "description": "Also send the results to the user's phone as a list "
+                                                            "with links (\"...and send it to my phone\")"}})
 if settings.telegram_photos or (settings.camera_url and settings.camera_token):
     TOOLS["look_at_last_photo"] = (look_at_last_photo, "Look again at the LATEST photo, from the camera or sent to the "
                                    "Telegram bot, without taking a new one (\"in that photo, what colour is...\", \"what's "
@@ -516,7 +539,7 @@ if settings.telegram_photos or (settings.camera_url and settings.camera_token):
     TOOLS["add_photo_item_to_shopping_list"] = (add_photo_item_to_shopping_list, "Put the item shown in the LATEST photo (camera or Telegram) "
                                                 "on the shopping list (\"add the thing in the photo to the list\"). It "
                                                 "looks at the photo itself: never guess the item.", {})
-_REQUIRED = {"calculate": ["expression"], "lookup_wikipedia": ["topic"], "set_reminder": ["text"], "set_alarm": ["at"],
+_REQUIRED = {"calculate": ["expression"], "lookup_wikipedia": ["topic"], "web_search": ["query"], "set_reminder": ["text"], "set_alarm": ["at"],
              "add_to_shopping_list": ["items"], "remove_from_shopping_list": ["items"], "send_to_phone": ["text"]}
 
 
@@ -529,7 +552,7 @@ def schemas() -> list[dict]:
 
 # Tools that run the vision model (4-6 s), plus a camera capture (1.5-3 s): the default 8 s isn't enough.
 SLOW_TOOLS = {"look_through_camera": 45, "look_at_last_photo": 40, "add_photo_item_to_shopping_list": 40,
-              "zoom_last_photo": 40}
+              "zoom_last_photo": 40, "web_search": 40}
 
 
 async def run(client: httpx.AsyncClient, name: str, arguments: str) -> str:
