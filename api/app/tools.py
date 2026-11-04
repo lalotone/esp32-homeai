@@ -172,6 +172,19 @@ _FUNCS = {n: getattr(math, n) for n in ("sqrt", "sin", "cos", "tan", "log", "log
                                         "factorial", "radians", "degrees")}
 _FUNCS.update(abs=abs, round=round, min=min, max=max)
 _CONSTS = {"pi": math.pi, "e": math.e}
+# Whole numbers far beyond anything worth saying aloud. Big ones also block the event loop while they're computed, and
+# json.dumps refuses those over 4300 digits. 4096 bits = ~1200 digits, which fits factorial(500), a round limit.
+MAX_RESULT_BITS = 4096
+MAX_FACTORIAL = 500
+
+
+def _factorial(n):
+    if n > MAX_FACTORIAL:
+        raise ValueError("number too large")
+    return math.factorial(n)
+
+
+_FUNCS["factorial"] = _factorial
 
 
 def _eval(node):
@@ -181,6 +194,9 @@ def _eval(node):
         left, right = _eval(node.left), _eval(node.right)
         if isinstance(node.op, ast.Pow) and abs(right) > 100:
             raise ValueError("exponent too large")
+        if (isinstance(node.op, ast.Pow) and isinstance(left, int) and isinstance(right, int)
+                and left.bit_length() * right > MAX_RESULT_BITS):  # (9**100)**100...: refused before it's computed
+            raise ValueError("number too large")
         return _OPS[type(node.op)](left, right)
     if isinstance(node, ast.UnaryOp) and type(node.op) in _OPS:
         return _OPS[type(node.op)](_eval(node.operand))
@@ -195,6 +211,12 @@ async def calculate(client: httpx.AsyncClient, expression: str) -> dict:
     if not isinstance(expression, str):  # Gemma 4 sometimes leaves it unquoted: llama.cpp read 240*0.17 as 0.17240
         raise ValueError('the expression must be a quoted string, like "240 * 0.17"')
     value = _eval(ast.parse(expression.replace("^", "**"), mode="eval").body)
+    if isinstance(value, complex):  # (-8) ** 0.5
+        raise ValueError("no real-number result")
+    if isinstance(value, int) and value.bit_length() > MAX_RESULT_BITS:
+        raise ValueError("number too large")
+    if isinstance(value, float) and not math.isfinite(value):  # 1e308 * 10
+        raise ValueError("no finite result")
     if isinstance(value, float):
         value = round(value, 6)
     return {"expression": expression, "result": value}
@@ -562,8 +584,9 @@ async def run(client: httpx.AsyncClient, name: str, arguments: str) -> str:
         fn = TOOLS[name][0]
         args = json.loads(arguments or "{}")
         result = await asyncio.wait_for(fn(client, **args), timeout=SLOW_TOOLS.get(name, HTTP_TIMEOUT_S + 2))
+        text = json.dumps(result, ensure_ascii=False)  # inside the try: a result it can't encode is a tool error too
     except Exception as e:  # anything a tool raises becomes a message the model can speak around
         logger.warning("tool %s(%s) failed: %r", name, arguments, e)
-        result = {"error": f"{type(e).__name__}: {e}"}
+        text = json.dumps({"error": f"{type(e).__name__}: {e}"}, ensure_ascii=False)
     logger.info("tool %s(%s) %.2fs", name, arguments, time.monotonic() - t0)
-    return json.dumps(result, ensure_ascii=False)
+    return text

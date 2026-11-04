@@ -49,7 +49,9 @@ def _save() -> None:
         logger.warning("could not save %s: %r", _path(), e)
 
 
-def _clean(items: list[str]) -> list[str]:
+def _clean(items: list[str] | str) -> list[str]:
+    if isinstance(items, str):  # the model sometimes sends one item as a plain string: it isn't a list of letters
+        items = [items]
     return [i.strip()[:60] for i in items if i and i.strip()]
 
 

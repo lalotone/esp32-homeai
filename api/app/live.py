@@ -3,8 +3,8 @@
 Said in a session ("live view", "watch this", "help me with this"), it stays on for the rest of that session:
   - every question gets a fresh camera photo, so there's no need to say "take a photo". Rocky answers it straight
     from the photo (answer()), in his own words: one vision call instead of a description that the main model then
-    rewrote (~4 s saved). A question that needs a tool (a timer, the weather...) goes the normal way instead
-    (llm.chat(look=True));
+    rewrote (~4 s saved). A question that needs a tool (a timer, the weather...) goes the normal way instead, with
+    all the tools and no photo unless the model asks for one (llm.chat(live=True));
   - while the user is quiet, the watcher looks at the bench every WATCH_EVERY_S. It speaks up when it clearly sees
     a mistake or a danger (a part in backwards, a wrong calculation, smoke...), or when the work changed since the
     last look (a part added, a wire connected, a new step written): short feedback on that change; or, when it
@@ -143,7 +143,7 @@ async def answer(transcript: str) -> str | None:
     except Exception as e:
         logger.warning("Live View answer failed, answering the normal way: %s", e)
         return None
-    if not reply or "TOOLS" in reply or (llm._ACTION.search(transcript) and llm._CLAIM.search(reply)):
+    if not reply or "TOOLS" in reply or (llm.is_action(transcript) and llm._CLAIM.search(reply)):
         logger.info("Live View: needs the normal way (%r)", reply)
         return None
     logger.info("Live View answered from the photo (%.1fs)", time.monotonic() - started)

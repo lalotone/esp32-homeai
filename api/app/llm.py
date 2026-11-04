@@ -33,6 +33,22 @@ _CLAIM = re.compile(r"\b(set|added|sent|cancel+ed|removed|cleared|done|ready|on 
 _NUDGE = ("[Check: you called no tool, so nothing was set, added, sent or cancelled. If this request needs a tool, "
           "call it now. If you really must ask the user something first, reply with only that question.]")
 _DIDNT_WORK = "Hmm, Rocky could not do that. Say it again, question?"
+# ...but "how do I add salt to pasta water?" asks for knowledge, not an action: its answer ("pasta ready in ten
+# minutes") was refused as a false claim. "Can you add milk?" is still a request, and so is anything about the user's
+# own alarms or list ("how long is left on my timer?"): an answer to those has to come from a tool. Bench questions
+# ("what happens if I put this in backwards?") are knowledge too; Live View's answers to them say "set" and "done".
+_KNOWLEDGE = re.compile(r"^\W*(why\b|how (do|does|can|could|should|would|to)\b|"
+                        r"how (much|many)\b(?!.*\b(alarm|timer|reminder)s?\b)|"
+                        r"(what|when|where|which)\b.{0,30}\b(do|does|can|could|should) (i|we|you|one|people)\b(?! have)|"
+                        r"(should|do) (i|we)\b(?! have)|does\b|is it (ok|okay|safe|bad|better|possible|normal|true)\b|"
+                        r"what (happens|if)\b|will (it|this|that)\b|"
+                        r"is (this|that)\b(?!.*\b(alarm|timer|reminder)s?\b)|"
+                        r"(what'?s|what is|which is) (the )?best\b|"
+                        r"((can|could|would) you |please |look at (this|that) and )?"
+                        r"(tell me|show me|explain|teach me)\b.{0,12}\b(how|where|what|which)\b"
+                        r"(?!.*\b(alarm|timer|reminder)s?\b))",
+                        re.I)
+_OWN_STATE = re.compile(r"\b(my|our) (\w+ )?(alarm|timer|reminder|list)|\bthe (shopping )?list\b", re.I)
 # A tool call the server couldn't parse comes back as the reply's text (seen with Gemma 4 after a failed call:
 # "<|tool_call>call:calculate{...}"). Never spoken: the round is asked again once, then _DIDNT_WORK.
 _MARKUP = re.compile(r"<\|?/?tool_call|<\|\"\|>|\bcall:\w+\{")
@@ -49,6 +65,8 @@ _DODGE = re.compile(r"\b(check|look|find out|cannot know|can't know|outside)\b",
 PHOTO_TOOLS = {"look_at_last_photo", "add_photo_item_to_shopping_list", "look_through_camera", "zoom_last_photo"}
 # Once a photo's content is in the turn, only these stay available: they only look (no setting, sending, changing).
 READ_ONLY_PHOTO_TOOLS = {"look_at_last_photo", "zoom_last_photo"}
+# After only these, nothing was changed, whatever the reply says.
+_LOOK_TOOLS = READ_ONLY_PHOTO_TOOLS | {"look_through_camera"}
 # Tools whose results come from outside (a photo, a web page): after one, the turn can't act, and the result isn't kept.
 UNTRUSTED_TOOLS = PHOTO_TOOLS | {"web_search"}
 # "Take a photo" / "what do you see?" always means a NEW photo: left to the model it sometimes reused one from minutes
@@ -59,6 +77,10 @@ _LAST_PHOTO_REF = re.compile(r"\b(last|that|previous|earlier|same|the) (photo|pi
                              r"\b(photo|picture|pic|image) (i|you) (sent|took)\b|[uú]ltima foto|esa foto", re.I)
 _CAMERA_ASK = re.compile(r"\b(what (do|can) you see|take (a|another|one more) (photo|picture|pic|shot)|look around|"
                          r"look at the room|qu[eé] ves|haz(me)? una foto)\b", re.I)
+# Live View's questions that reach the main model need more than a look: they keep all the tools (a look first would
+# take the action ones away), so the model is told the camera is there when it needs it.
+_LIVE_HINT = (" Live View is on: the camera is watching the user's bench. For anything about what is in front of them, "
+              "call look_through_camera.")
 
 # Recent exchanges as (time, messages of that turn). One speaker, one conversation, so module state is enough.
 # The turn's tool calls and (trimmed) results are kept too: with only the final answers in the history, the model
@@ -91,11 +113,16 @@ def _remember(turn: list[dict]) -> None:
     del _history[:-settings.history_turns]
 
 
-async def chat(user_text: str, from_user: bool = True, look: bool = False) -> str:
+def is_action(user_text: str) -> bool:
+    """The user asks to change something (set, add, send...), so a success can only come from a tool."""
+    return bool(_ACTION.search(user_text)) and (not _KNOWLEDGE.search(user_text) or bool(_OWN_STATE.search(user_text)))
+
+
+async def chat(user_text: str, from_user: bool = True, live: bool = False) -> str:
     """Send one user turn and return the assistant's reply text. from_user=False for prompts the API composes itself
-    (alarm briefings, song results): they aren't requests, so the no-tool-call check doesn't apply. look=True (Live
-    View): the answer gets a fresh camera photo, as if they'd asked "what do you see?"."""
-    reply, turn = await _chat(user_text, from_user, look)
+    (alarm briefings, song results): they aren't requests, so the no-tool-call check doesn't apply. live=True: Live
+    View is on (see _LIVE_HINT)."""
+    reply, turn = await _chat(user_text, from_user, live)
     if reply:
         _remember(turn)
     return reply
@@ -113,11 +140,12 @@ def recent_lines(n: int = 6) -> str:
     return "\n".join(lines[-n:])
 
 
-async def _chat(user_text: str, from_user: bool = True, look: bool = False) -> tuple[str, list[dict]]:
+async def _chat(user_text: str, from_user: bool = True, live: bool = False) -> tuple[str, list[dict]]:
     """The reply, and this turn's messages (user, tool calls/results, final answer) for the history."""
     url = settings.llm_base_url.rstrip("/") + "/chat/completions"
     turn = [{"role": "user", "content": user_text}]
-    messages = [{"role": "system", "content": settings.system_prompt}, *_recent(), *turn]
+    system = settings.system_prompt + (_LIVE_HINT if live else "")
+    messages = [{"role": "system", "content": system}, *_recent(), *turn]
     payload = {
         "model": settings.llm_model,
         "messages": messages,
@@ -127,7 +155,7 @@ async def _chat(user_text: str, from_user: bool = True, look: bool = False) -> t
     }
     if settings.tools_enabled:
         payload["tools"] = tools.schemas()
-    action = from_user and settings.tools_enabled and bool(_ACTION.search(user_text))
+    action = from_user and settings.tools_enabled and is_action(user_text)
     used_tool = nudged = retried = False
     used_names: set[str] = set()
     fetched_weather = False
@@ -139,17 +167,18 @@ async def _chat(user_text: str, from_user: bool = True, look: bool = False) -> t
 
     async with httpx.AsyncClient(timeout=settings.llm_timeout_s) as client:
         refers_back = bool(_LAST_PHOTO_REF.search(user_text))
-        if (from_user and "look_through_camera" in tools.TOOLS and (look or _CAMERA_ASK.search(user_text))
-                and not refers_back):
+        if not from_user or action:
+            # "Add the thing in the photo to the list": a look here would take the action tools away (_photo_only),
+            # so a request that changes something stays with the model.
+            auto = None
+        elif "look_through_camera" in tools.TOOLS and _CAMERA_ASK.search(user_text) and not refers_back:
             auto = "look_through_camera"          # "take a photo" / "what do you see?": a NEW photo
-        elif from_user and refers_back and "look_at_last_photo" in tools.TOOLS and photos.last_photo():
+        elif refers_back and "look_at_last_photo" in tools.TOOLS and photos.last_photo():
             auto = "look_at_last_photo"           # "...on the last photo?": the one already taken
         else:
             auto = None
         if auto:
-            # Live View: a look per question, so only the essentials (a 120-word description takes ~5 s to write).
-            brief = " (Answer in under 60 words: just what matters for this.)" if look else ""
-            args = json.dumps({"question": user_text + brief})
+            args = json.dumps({"question": user_text})
             call = {"id": "auto_photo", "type": "function", "function": {"name": auto, "arguments": args}}
             result = await tools.run(client, auto, args)
             messages.extend([{"role": "assistant", "content": "", "tool_calls": [call]},
@@ -197,6 +226,10 @@ async def _chat(user_text: str, from_user: bool = True, look: bool = False) -> t
                     if _CLAIM.search(reply) and "?" not in reply:
                         logger.warning("claimed without a tool after the nudge, refusing: %r", reply)
                         reply = _DIDNT_WORK
+                # A look took the action tools away, so "added" can't be true (asking again wouldn't help either).
+                if action and used_names and used_names <= _LOOK_TOOLS and _CLAIM.search(reply) and "?" not in reply:
+                    logger.warning("claimed after only looking at a photo, refusing: %r", reply)
+                    reply = _DIDNT_WORK
                 turn.append({"role": "assistant", "content": reply})
                 return reply, turn
 
