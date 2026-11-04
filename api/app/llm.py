@@ -15,7 +15,7 @@ import time
 
 import httpx
 
-from . import memory, photos, tools
+from . import guide, learning, memory, photos, tools
 from .config import settings
 
 logger = logging.getLogger("uvicorn.error")
@@ -58,6 +58,12 @@ _MEMORY_DROP = re.compile(r"(?<!don't )(?<!dont )(?<!do not )(?<!\bi )\bforget\b
                           r"\b(delete|erase|remove)\b.{0,40}\b(memory|memories|note|notes)\b", re.I)
 _MEMORY_UNDO = re.compile(r"\b(undo|bring (it|that|them) back|remember (it|that|them) again)\b", re.I)
 _QUESTION = re.compile(r"^\W*((hey )?rocky\W+)?(what|do|does|did|how|why|when|where|which|who)\b", re.I)
+# "Walk me through making pancakes": only these turns get start_guide, and the longer answer its steps need.
+_GUIDE_ASK = re.compile(r"\b(step by step|step-by-step|walk me through|talk me through|take me through|guide me|"
+                        r"one step at a time)\b", re.I)
+GUIDE_MAX_TOKENS = 1000
+_CORRECTING_HINT = (" The user just corrected your last answer. Save what you learned with the remember tool, as one short "
+                    "fact starting with \"Correction:\", then say briefly what you learned.")
 # A tool call the server couldn't parse comes back as the reply's text (seen with Gemma 4 after a failed call:
 # "<|tool_call>call:calculate{...}"). Never spoken: the round is asked again once, then _DIDNT_WORK.
 _MARKUP = re.compile(r"<\|?/?tool_call|<\|\"\|>|\bcall:\w+\{")
@@ -127,9 +133,11 @@ def asks_memory(user_text: str) -> bool:
     return not _QUESTION.search(user_text) and bool(_MEMORY_SAVE.search(user_text) or _MEMORY_DROP.search(user_text))
 
 
-def _tool_schemas(user_text: str, from_user: bool) -> list[dict]:
-    """All the tools, except the memory ones the user's own words didn't ask for: a headline or a page can't get them."""
-    allowed = set()
+def _tool_schemas(user_text: str, from_user: bool, correcting: bool = False) -> list[dict]:
+    """All the tools, except those the user's own words didn't ask for: a headline or a web page can't get them."""
+    allowed = {"remember"} if correcting else set()
+    if from_user and _GUIDE_ASK.search(user_text):
+        allowed.add("start_guide")
     if from_user and not _QUESTION.search(user_text):
         if _MEMORY_SAVE.search(user_text):
             allowed.add("remember")
@@ -137,13 +145,13 @@ def _tool_schemas(user_text: str, from_user: bool) -> list[dict]:
             allowed.add("forget_memory")
         if _MEMORY_UNDO.search(user_text) and memory.can_undo():
             allowed.add("undo_forget_memory")
-    hidden = tools.MEMORY_TOOLS - allowed
+    hidden = tools.GATED_TOOLS - allowed
     return [s for s in tools.schemas() if s["function"]["name"] not in hidden]
 
 
 def is_action(user_text: str) -> bool:
     """The user asks to change something (set, add, send...), so a success can only come from a tool."""
-    return asks_memory(user_text) or (bool(_ACTION.search(user_text))
+    return asks_memory(user_text) or bool(_GUIDE_ASK.search(user_text)) or (bool(_ACTION.search(user_text))
                                       and (not _KNOWLEDGE.search(user_text) or bool(_OWN_STATE.search(user_text))))
 
 
@@ -155,11 +163,22 @@ async def _run_offered(client: httpx.AsyncClient, call: dict, offered: set[str])
     return await tools.run(client, name, call["function"].get("arguments"))
 
 
-async def chat(user_text: str, from_user: bool = True, live: bool = False) -> str:
+def last_exchange() -> dict:
+    """What the user may be complaining about: their last question, Rocky's answer, the tools used."""
+    if not _history:
+        return {}
+    msgs = _history[-1][1]
+    said = [m.get("content") for m in msgs if m["role"] == "user"]
+    answers = [m.get("content") for m in msgs if m["role"] == "assistant" and m.get("content")]
+    used = [c["function"]["name"] for m in msgs for c in m.get("tool_calls") or []]
+    return {"user": said[0] if said else "", "reply": answers[-1] if answers else "", "tools": used}
+
+
+async def chat(user_text: str, from_user: bool = True, live: bool = False, correcting: bool = False) -> str:
     """Send one user turn and return the assistant's reply text. from_user=False for prompts the API composes itself
     (alarm briefings, song results): they aren't requests, so the no-tool-call check doesn't apply. live=True: Live
-    View is on (see _LIVE_HINT)."""
-    reply, turn = await _chat(user_text, from_user, live)
+    View is on (see _LIVE_HINT). correcting=True: the user is telling Rocky what he got wrong (see learning.py)."""
+    reply, turn = await _chat(user_text, from_user, live, correcting)
     if reply:
         _remember(turn)
     return reply
@@ -177,11 +196,13 @@ def recent_lines(n: int = 6) -> str:
     return "\n".join(lines[-n:])
 
 
-async def _chat(user_text: str, from_user: bool = True, live: bool = False) -> tuple[str, list[dict]]:
+async def _chat(user_text: str, from_user: bool = True, live: bool = False,
+                correcting: bool = False) -> tuple[str, list[dict]]:
     """The reply, and this turn's messages (user, tool calls/results, final answer) for the history."""
     url = settings.llm_base_url.rstrip("/") + "/chat/completions"
     turn = [{"role": "user", "content": user_text}]
-    system = settings.system_prompt + memory.prompt_block() + (_LIVE_HINT if live else "")
+    system = (settings.system_prompt + memory.prompt_block() + guide.prompt_block() + (_LIVE_HINT if live else "")
+              + (_CORRECTING_HINT if correcting else ""))
     messages = [{"role": "system", "content": system}, *_recent(), *turn]
     payload = {
         "model": settings.llm_model,
@@ -191,8 +212,10 @@ async def _chat(user_text: str, from_user: bool = True, live: bool = False) -> t
         "stream": False,
     }
     if settings.tools_enabled:
-        payload["tools"] = _tool_schemas(user_text, from_user)
-    action = from_user and settings.tools_enabled and is_action(user_text)
+        payload["tools"] = _tool_schemas(user_text, from_user, correcting)
+        if any(t["function"]["name"] == "start_guide" for t in payload["tools"]):
+            payload["max_tokens"] = GUIDE_MAX_TOKENS
+    action = from_user and settings.tools_enabled and (correcting or is_action(user_text))
     used_tool = nudged = retried = False
     used_names: set[str] = set()
     fetched_weather = False
@@ -240,6 +263,7 @@ async def _chat(user_text: str, from_user: bool = True, live: bool = False) -> t
                         retried = True
                         continue
                     reply = _DIDNT_WORK
+                    learning.log("tool_markup", user=user_text)
                 if (from_user and "tools" in payload and "get_weather" in tools.TOOLS and not fetched_weather
                         and not used_names & _WEATHER_TOOLS and not used_names & UNTRUSTED_TOOLS
                         and (_WEATHER_FACT.search(reply) or (_WEATHER_ASK.search(user_text) and _DODGE.search(reply)))):
@@ -262,10 +286,12 @@ async def _chat(user_text: str, from_user: bool = True, live: bool = False) -> t
                         continue
                     if _CLAIM.search(reply) and "?" not in reply:
                         logger.warning("claimed without a tool after the nudge, refusing: %r", reply)
+                        learning.log("refused_claim", user=user_text, reply=reply)
                         reply = _DIDNT_WORK
                 # A look took the action tools away, so "added" can't be true (asking again wouldn't help either).
                 if action and used_names and used_names <= _LOOK_TOOLS and _CLAIM.search(reply) and "?" not in reply:
                     logger.warning("claimed after only looking at a photo, refusing: %r", reply)
+                    learning.log("refused_claim", user=user_text, reply=reply, tools=sorted(used_names))
                     reply = _DIDNT_WORK
                 turn.append({"role": "assistant", "content": reply})
                 return reply, turn

@@ -60,6 +60,10 @@ static SemaphoreHandle_t s_speaker_lock;
 #define LIVE_SLICE_MS           3000
 #define LIVE_POLL_TIMEOUT_MS    3000
 
+// Step by step ("walk me through..."): hands are busy between steps, so the session waits GUIDE_WINDOW_MS. The speaker lock
+// is held all that time, so this wait also asks GET /pending: a cooking timer has to ring, not wait for the session's end.
+#define GUIDE_WINDOW_MS         120000
+
 // Acknowledgments: while a question is on its way, a second request (GET /ack) waits for the short clip the API sends
 // when an answer turns out to be slow ("searching, searching"). The API always answers it within seconds.
 #define ACK_HTTP_TIMEOUT_MS     15000
@@ -110,6 +114,7 @@ static void fill_wav_header(wav_header_t *h, uint32_t pcm_bytes)
 typedef struct {
     bool end;   // X-Session: end (the user said goodbye)
     bool live;  // X-Live: on (Live View is on)
+    bool guide; // X-Guide: on (a step-by-step guide is on)
 } session_info_t;
 
 static esp_err_t session_header_handler(esp_http_client_event_t *evt)
@@ -122,6 +127,8 @@ static esp_err_t session_header_handler(esp_http_client_event_t *evt)
         info->end = strcasecmp(evt->header_value, "end") == 0;
     } else if (strcasecmp(evt->header_key, "X-Live") == 0) {
         info->live = strcasecmp(evt->header_value, "on") == 0;
+    } else if (strcasecmp(evt->header_key, "X-Guide") == 0) {
+        info->guide = strcasecmp(evt->header_value, "on") == 0;
     }
     return ESP_OK;
 }
@@ -400,17 +407,21 @@ static void ack_finish(const char *ack_id)
 // Waits for the next question in a session. Normally FOLLOWUP_WINDOW_MS; in Live View
 // LIVE_WINDOW_MS of quiet, in slices, playing any warning the API prepared in between (a
 // warning restarts the wait, so the user can answer it). *live turns false when the API
-// says Live View is over. *out_heard: someone started talking (the recording is in *out_buf).
-static esp_err_t wait_for_followup(bool *live, int16_t **out_buf, int *out_frames, bool *out_heard)
+// says Live View is over. In a guide, GUIDE_WINDOW_MS, playing any timer that comes due.
+// *out_heard: someone started talking (the recording is in *out_buf).
+static esp_err_t wait_for_followup(bool *live, bool guide, int16_t **out_buf, int *out_frames, bool *out_heard)
 {
-    if (!*live) {
+    if (!*live && !guide) {
         return audio_capture_vad_wait(FOLLOWUP_WINDOW_MS, FOLLOWUP_MIN_SPEECH, out_buf, out_frames, out_heard);
     }
-    char url[APP_CONFIG_URL_MAX_LEN];
-    api_url(url, sizeof(url), "/live/next");
+    char url[APP_CONFIG_URL_MAX_LEN + 16];
     int quiet_ms = 0;
     while (true) {
-        led_ring_set_color(255, 96, 0); // amber: Live View, listening (and the camera watching)
+        if (*live) {
+            led_ring_set_color(255, 96, 0); // amber: Live View, listening (and the camera watching)
+        } else {
+            led_ring_set_color(255, 0, 255); // magenta: listening for the next step
+        }
         esp_err_t ret = audio_capture_vad_wait(LIVE_SLICE_MS, FOLLOWUP_MIN_SPEECH, out_buf, out_frames, out_heard);
         if (ret != ESP_OK || *out_heard) {
             return ret;
@@ -418,13 +429,15 @@ static esp_err_t wait_for_followup(bool *live, int16_t **out_buf, int *out_frame
         free(*out_buf);
         *out_buf = NULL;
         quiet_ms += LIVE_SLICE_MS;
-        if (quiet_ms >= (*live ? LIVE_WINDOW_MS : FOLLOWUP_WINDOW_MS)) {
+        if (quiet_ms >= (*live ? LIVE_WINDOW_MS : guide ? GUIDE_WINDOW_MS : FOLLOWUP_WINDOW_MS)) {
             return ESP_OK; // nobody spoke: the session ends
         }
         int status = 0;
         uint8_t *resp = NULL;
         size_t resp_len = 0;
-        if (http_get_and_read(url, LIVE_POLL_TIMEOUT_MS, &status, &resp, &resp_len) != ESP_OK) {
+        api_url(url, sizeof(url), *live ? "/live/next" : "/pending");
+        // /pending makes the announcement's speech before answering, and a due alert isn't offered twice.
+        if (http_get_and_read(url, *live ? LIVE_POLL_TIMEOUT_MS : ANNOUNCE_HTTP_TIMEOUT_MS, &status, &resp, &resp_len) != ESP_OK) {
             continue; // the API is unreachable for a moment: keep listening
         }
         if (status == 410) {
@@ -443,7 +456,7 @@ static esp_err_t wait_for_followup(bool *live, int16_t **out_buf, int *out_frame
 // uploads nothing if the user stays quiet. *out_answered: a real answer was played (so a
 // further follow-up makes sense). *out_end: the user said goodbye, the session is over.
 // *live: Live View is on (in: for the wait; out: what the API says after this answer).
-static esp_err_t one_turn(bool followup, bool *out_answered, bool *out_end, bool *live)
+static esp_err_t one_turn(bool followup, bool *out_answered, bool *out_end, bool *live, bool *guide)
 {
     *out_answered = false;
     *out_end = false;
@@ -455,7 +468,7 @@ static esp_err_t one_turn(bool followup, bool *out_answered, bool *out_end, bool
     if (followup) {
         vTaskDelay(pdMS_TO_TICKS(FOLLOWUP_ECHO_GAP_MS));
         bool heard = false;
-        ret = wait_for_followup(live, &mono_buf, &total_frames, &heard);
+        ret = wait_for_followup(live, *guide, &mono_buf, &total_frames, &heard);
         if (ret == ESP_OK && !heard) {
             ESP_LOGI(TAG, "No follow-up: back to the wake word");
             free(mono_buf);
@@ -512,6 +525,7 @@ static esp_err_t one_turn(bool followup, bool *out_answered, bool *out_end, bool
     free(wav_buf);
     *out_end = info.end;
     *live = info.live;
+    *guide = info.guide;
 
     if (ret != ESP_OK) {
         mic_speech_pause_feed(false);
@@ -550,7 +564,7 @@ static esp_err_t one_turn(bool followup, bool *out_answered, bool *out_end, bool
     led_ring_off();
     // A real answer keeps the session going; in Live View even the "nothing heard" blip does (a
     // noise at the bench), the silence window still ends it.
-    *out_answered = resp_frames / (float)AUDIO_CAPTURE_SAMPLE_RATE > NOTHING_HEARD_MAX_S || *live;
+    *out_answered = resp_frames / (float)AUDIO_CAPTURE_SAMPLE_RATE > NOTHING_HEARD_MAX_S || *live || *guide;
     ESP_LOGI(TAG, "Done");
     return ESP_OK;
 }
@@ -561,11 +575,11 @@ static esp_err_t ask_locked(void)
         ESP_LOGW(TAG, "WiFi not connected, skipping");
         return ESP_ERR_INVALID_STATE;
     }
-    bool answered = false, end = false, live = false;
-    esp_err_t ret = one_turn(false, &answered, &end, &live);
+    bool answered = false, end = false, live = false, guide = false;
+    esp_err_t ret = one_turn(false, &answered, &end, &live, &guide);
     for (int i = 0; ret == ESP_OK && answered && !end && i < FOLLOWUP_MAX_TURNS; i++) {
         ESP_LOGI(TAG, "Listening for a follow-up (%d/%d)%s...", i + 1, FOLLOWUP_MAX_TURNS, live ? ", Live View" : "");
-        ret = one_turn(true, &answered, &end, &live);
+        ret = one_turn(true, &answered, &end, &live, &guide);
     }
     if (end) {
         ESP_LOGI(TAG, "Goodbye: back to the wake word");

@@ -38,6 +38,8 @@ Ask in plain words; the LLM picks the tool (`app/tools.py`). Short-term memory k
 | "Wake me up at 7:30", "every weekday at 7" | `set_alarm` | same; rings with the morning briefing, composed ~2 min ahead |
 | "Add milk to the list", "clear the list", "undo" | shopping-list tools | `STATE_DIR/shopping.json` |
 | "Remember that I take coffee without sugar", "what do you remember about me?", "forget the coffee thing", "undo" | `remember`, `forget_memory`, `undo_forget_memory` | `STATE_DIR/memory.json`, up to 30 short facts in every prompt. Saved only when you ask; refuses passwords and card numbers |
+| "Walk me through making pancakes", then "next", "back", "repeat", "go to step 3", "how many left?", "stop" | `start_guide`, then plain code (no model call) | `STATE_DIR/guide.json`. The board listens 2 minutes between steps and timers still ring; after that, "Hey Rocky, next" keeps your place for a day. The model writes the steps from what it knows, so check anything risky |
+| "That was wrong", then the right answer (or both at once) | `remember`, as a `Correction:` note | he uses it in every later answer; "what do you remember?" and "forget..." work on it. See **Learning** below |
 | "Good morning!" | `get_morning_briefing` | weather + today's reminders + 2 news + shopping list size |
 | "What song is this?" | `identify_song` | Shazam (unofficial, see below); the speaker's follow-up window records the music |
 | "Send me the list / that recipe", "remind me **on my phone**" | `send_shopping_list`, `send_to_phone` | Telegram bot, one-way to `TELEGRAM_CHAT_ID` only |
@@ -51,6 +53,17 @@ Ask in plain words; the LLM picks the tool (`app/tools.py`). Short-term memory k
 catches an action request ("wake me", "add", "cancel", "send"...) that ended without a tool call, nudges the model
 once, and if it still claims success replies "Rocky could not do that" instead. Recognized songs also go to Telegram
 when it's set up.
+
+## Learning
+
+Rocky learns in two ways:
+
+- **Right away:** "that was wrong" gets "What is right, question?", and your answer becomes a saved note in every prompt.
+- **Later:** complaints, answers refused as false claims and tool errors go to `STATE_DIR/feedback.jsonl`, for finding what
+  the code or prompts should do better. Read it in a cluster with
+  `kubectl -n voice exec deploy/esp32-homeai-api -- cat /state/feedback.jsonl`. It holds what was said, and stays on this machine.
+
+He doesn't learn by himself: nothing changes unless you correct him or someone acts on the log.
 
 ## Privacy
 
@@ -170,7 +183,7 @@ Only use voices you have the right to use, and don't publish clips or outputs cl
 | Where | What | How to set it up |
 |---|---|---|
 | `api/.env` | LLM endpoint/model, Whisper size, device, home location, Telegram token + chat id, any `SYSTEM_PROMPT` override | `first_run.sh` copies `.env.example`; edit it |
-| `api/state/` | timers, alarms, reminders, shopping list, what Rocky remembers, acknowledgment clips | created on first use (`STATE_DIR`) |
+| `api/state/` | timers, alarms, reminders, shopping list, what Rocky remembers, acknowledgment clips, the current guide, the feedback log | created on first use (`STATE_DIR`) |
 | `api/rocky/` | voice reference | see above |
 | ESP32 NVS | WiFi SSID/password and this server's URL (`http://<this machine's LAN IP>:8000/talk`) | the board's config portal, see [`firmware/README.md`](../firmware/README.md). The committed `sdkconfig` only has placeholders |
 

@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-from . import acks, alerts, memory, photos, shopping, songs, telegram, websearch
+from . import acks, alerts, guide, learning, memory, photos, shopping, songs, telegram, websearch
 from .config import settings
 
 logger = logging.getLogger("uvicorn.error")
@@ -380,6 +380,12 @@ async def undo_forget_memory(client: httpx.AsyncClient) -> dict:
     return memory.undo_forget()
 
 
+# --- step-by-step mode (guide.py) ---
+
+async def start_guide(client: httpx.AsyncClient, title: str, steps: list[str]) -> dict:
+    return guide.start(title, steps)
+
+
 async def clear_shopping_list(client: httpx.AsyncClient) -> dict:
     return shopping.clear()
 
@@ -583,7 +589,15 @@ TOOLS["remember"] = (remember, "Save a fact about the user for all future conver
 TOOLS["forget_memory"] = (forget_memory, "Forget saved facts about the user, because they asked you to.", {
     "about": {"type": "string", "description": "A word or two from the fact, like \"coffee\"; or \"everything\""}})
 TOOLS["undo_forget_memory"] = (undo_forget_memory, "Bring back the facts that were just forgotten.", {})
-_REQUIRED = {"remember": ["fact"], "forget_memory": ["about"], "calculate": ["expression"], "lookup_wikipedia": ["topic"], "web_search": ["query"], "set_reminder": ["text"], "set_alarm": ["at"],
+TOOLS["start_guide"] = (start_guide, "Start walking the user through something step by step, hands-free (a recipe, a repair, "
+                        "an assembly), when they ask for that. Write every step now. Then speak only the first step: "
+                        "they say \"next\" for the others.", {
+    "title": {"type": "string", "description": "What this is, in a few words"},
+    "steps": {"type": "array", "items": {"type": "string"},
+              "description": "3 to 15 steps, each one short action to do with the hands busy, under 30 words"}})
+# Offered only on a turn that asks for them (llm.py).
+GATED_TOOLS = MEMORY_TOOLS | {"start_guide"}
+_REQUIRED = {"remember": ["fact"], "forget_memory": ["about"], "start_guide": ["title", "steps"], "calculate": ["expression"], "lookup_wikipedia": ["topic"], "web_search": ["query"], "set_reminder": ["text"], "set_alarm": ["at"],
              "add_to_shopping_list": ["items"], "remove_from_shopping_list": ["items"], "send_to_phone": ["text"]}
 
 
@@ -610,6 +624,7 @@ async def run(client: httpx.AsyncClient, name: str, arguments: str) -> str:
         text = json.dumps(result, ensure_ascii=False)  # inside the try: a result it can't encode is a tool error too
     except Exception as e:  # anything a tool raises becomes a message the model can speak around
         logger.warning("tool %s(%s) failed: %r", name, arguments, e)
+        learning.log("tool_error", tool=name, error=f"{type(e).__name__}: {e}"[:200])
         text = json.dumps({"error": f"{type(e).__name__}: {e}"}, ensure_ascii=False)
     logger.info("tool %s(%s) %.2fs", name, arguments, time.monotonic() - t0)
     return text

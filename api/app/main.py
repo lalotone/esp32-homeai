@@ -28,7 +28,7 @@ from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 from starlette.concurrency import run_in_threadpool
 
-from . import acks, alerts, announce, live, llm, photos, songs, stt, telegram, tools, tts
+from . import acks, alerts, announce, guide, learning, live, llm, photos, songs, stt, telegram, tools, tts
 from .config import settings
 
 logger = logging.getLogger("uvicorn.error")
@@ -328,7 +328,14 @@ async def _talk(request: Request, audio: UploadFile | None) -> Response:
         # (a new session: Live View starts off).
         goodbye = _is_goodbye(transcript)
         look = live.on_question(transcript, wake=request.headers.get("x-turn") != "follow") and not goodbye
-        reply = (await live.answer(transcript) if look else None) or await llm.chat(transcript, live=look)
+        said = learning.on_turn(transcript, llm.last_exchange())
+        # Answered without the model: a complaint, or "next" in a guide. Kept, so a follow-up knows what was said.
+        reply = said.reply or guide.handle(transcript)
+        if reply:
+            llm.note(transcript, reply)
+        else:
+            reply = ((await live.answer(transcript) if look and not said.correcting else None)
+                     or await llm.chat(transcript, live=look, correcting=said.correcting))
         wav_bytes = await run_in_threadpool(tts.synthesize, reply)
     finally:
         os.unlink(in_path)
@@ -347,5 +354,6 @@ async def _talk(request: Request, audio: UploadFile | None) -> Response:
             "X-Reply": quote(reply),
             "X-Session": "end" if goodbye else "open",
             "X-Live": "on" if live.active() else "off",  # Live View: the board listens longer, and asks for warnings
+            "X-Guide": "on" if guide.active() else "off",  # step by step: the board listens longer between steps
         },
     )
