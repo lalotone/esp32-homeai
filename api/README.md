@@ -40,6 +40,7 @@ Ask in plain words; the LLM picks the tool (`app/tools.py`). Short-term memory k
 | "Remember that I take coffee without sugar", "what do you remember about me?", "forget the coffee thing", "undo" | `remember`, `forget_memory`, `undo_forget_memory` | `STATE_DIR/memory.json`, up to 30 short facts in every prompt. Saved only when you ask; refuses passwords and card numbers |
 | "Walk me through making pancakes", then "next", "back", "repeat", "go to step 3", "how many left?", "stop" | `start_guide`, then plain code (no model call) | `STATE_DIR/guide.json`. The board listens 2 minutes between steps and timers still ring; after that, "Hey Rocky, next" keeps your place for a day. The model writes the steps from what it knows, so check anything risky |
 | "That was wrong", then the right answer (or both at once) | `remember`, as a `Correction:` note | he uses it in every later answer; "what do you remember?" and "forget..." work on it. See **Learning** below |
+| "Start guardian mode for two hours", "stop guardian mode", "is guardian on?" | plain code + the camera + your LLM's vision | every 10 s a photo is compared with the last; on a change, the model looks for a person or animal, a second photo confirms, and Telegram gets a text (see **Guardian mode**) |
 | "Good morning!" | `get_morning_briefing` | weather + today's reminders + 2 news + shopping list size |
 | "What song is this?" | `identify_song` | Shazam (unofficial, see below); the speaker's follow-up window records the music |
 | "Send me the list / that recipe", "remind me **on my phone**" | `send_shopping_list`, `send_to_phone` | Telegram bot, one-way to `TELEGRAM_CHAT_ID` only |
@@ -53,6 +54,18 @@ Ask in plain words; the LLM picks the tool (`app/tools.py`). Short-term memory k
 catches an action request ("wake me", "add", "cancel", "send"...) that ended without a tool call, nudges the model
 once, and if it still claims success replies "Rocky could not do that" instead. Recognized songs also go to Telegram
 when it's set up.
+
+## Guardian mode
+
+Tells your phone if the camera sees a person or an animal. It waits a minute so you can leave, runs for 2 hours unless you
+say otherwise (12 at most), and tells Telegram when it starts and ends, and if it can't look for a minute. Comparing photos
+is plain code, so the GPU only works when something changed, or once every 5 minutes. At most one alert per kind every 5 minutes.
+
+- **Not a security system:** anyone in the room can stop it by voice, and it sees nothing in the dark, or with the camera
+  or the GPU node off. It ends at `QUIET_HOURS`. Something crossing the view in under ~2 s can be missed.
+- **Telegram stays one-way:** it can't be started or stopped from there.
+- **Photos:** alerts are text unless you set `GUARDIAN_PHOTOS=true`, which sends pictures of your home through Telegram's
+  servers. Nothing is saved to disk, and people in view should know it's on.
 
 ## Learning
 

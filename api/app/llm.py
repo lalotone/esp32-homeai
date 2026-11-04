@@ -15,7 +15,7 @@ import time
 
 import httpx
 
-from . import guide, learning, memory, photos, tools
+from . import guardian, guide, learning, memory, photos, tools
 from .config import settings
 
 logger = logging.getLogger("uvicorn.error")
@@ -201,7 +201,8 @@ async def _chat(user_text: str, from_user: bool = True, live: bool = False,
     """The reply, and this turn's messages (user, tool calls/results, final answer) for the history."""
     url = settings.llm_base_url.rstrip("/") + "/chat/completions"
     turn = [{"role": "user", "content": user_text}]
-    system = (settings.system_prompt + memory.prompt_block() + guide.prompt_block() + (_LIVE_HINT if live else "")
+    system = (settings.system_prompt + memory.prompt_block() + guide.prompt_block() + guardian.prompt_block()
+              + (_LIVE_HINT if live else "")
               + (_CORRECTING_HINT if correcting else ""))
     messages = [{"role": "system", "content": system}, *_recent(), *turn]
     payload = {

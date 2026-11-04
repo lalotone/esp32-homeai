@@ -145,6 +145,8 @@ class Settings:
     camera_url: str = _get("CAMERA_URL", "")
     camera_token: str = _get("CAMERA_TOKEN", "")
     camera_in_quiet_hours: bool = _get("CAMERA_IN_QUIET_HOURS", "false").lower() == "true"
+    # Guardian mode's alerts include the photo. Off by default: it sends pictures of the home through Telegram's servers.
+    guardian_photos: bool = _get("GUARDIAN_PHOTOS", "false").lower() == "true"
     # A SearXNG instance for the web_search tool (e.g. http://searxng:8080), with the json format enabled in its
     # settings. Empty = no web search.
     searxng_url: str = _get("SEARXNG_URL", "")

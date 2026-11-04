@@ -54,6 +54,21 @@ async def send(text: str) -> None:
     await _call("sendMessage", chat_id=settings.telegram_chat_id, text=text[:MAX_CHARS])
 
 
+async def send_photo(jpeg: bytes, caption: str) -> None:
+    """A photo to the user's chat. Multipart, so not _call, and with the same care for the token in errors."""
+    if not configured():
+        raise TelegramError("Telegram is not set up (no bot token or chat id)")
+    url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendPhoto"
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(url, data={"chat_id": settings.telegram_chat_id, "caption": caption[:1000]},
+                                     files={"photo": ("photo.jpg", jpeg, "image/jpeg")})
+    except httpx.HTTPError as e:
+        raise TelegramError(f"Telegram unreachable: {type(e).__name__}") from None
+    if resp.status_code != 200:
+        raise TelegramError(f"Telegram refused sendPhoto ({resp.status_code})")
+
+
 async def get_updates(offset: int | None, timeout: int = POLL_TIMEOUT_S) -> list[dict]:
     """Pending updates after `offset`. Only plain messages are requested: no edits, channel posts, buttons, inline
     queries or anything else Telegram can deliver."""

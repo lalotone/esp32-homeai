@@ -28,7 +28,7 @@ from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 from starlette.concurrency import run_in_threadpool
 
-from . import acks, alerts, announce, guide, learning, live, llm, photos, songs, stt, telegram, tools, tts
+from . import acks, alerts, announce, guardian, guide, learning, live, llm, photos, songs, stt, telegram, tools, tts
 from .config import settings
 
 logger = logging.getLogger("uvicorn.error")
@@ -143,6 +143,7 @@ async def start_alarm_loop() -> None:
 @app.on_event("startup")
 async def start_live_view() -> None:
     asyncio.get_running_loop().create_task(live.watch_loop(_busy.locked))
+    asyncio.get_running_loop().create_task(guardian.loop(lambda: _busy.locked() or live.active()))
 
 
 @app.get("/live/next")
@@ -329,8 +330,9 @@ async def _talk(request: Request, audio: UploadFile | None) -> Response:
         goodbye = _is_goodbye(transcript)
         look = live.on_question(transcript, wake=request.headers.get("x-turn") != "follow") and not goodbye
         said = learning.on_turn(transcript, llm.last_exchange())
-        # Answered without the model: a complaint, or "next" in a guide. Kept, so a follow-up knows what was said.
-        reply = said.reply or guide.handle(transcript)
+        # Answered without the model: a complaint, a guardian command, or "next" in a guide. Kept, so a follow-up knows
+        # what was said.
+        reply = said.reply or await guardian.handle(transcript) or guide.handle(transcript)
         if reply:
             llm.note(transcript, reply)
         else:
