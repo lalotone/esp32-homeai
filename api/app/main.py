@@ -28,7 +28,7 @@ from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 from starlette.concurrency import run_in_threadpool
 
-from . import alerts, announce, live, llm, photos, songs, stt, telegram, tools, tts
+from . import acks, alerts, announce, live, llm, photos, songs, stt, telegram, tools, tts
 from .config import settings
 
 logger = logging.getLogger("uvicorn.error")
@@ -42,6 +42,7 @@ def load_voice() -> None:
     # the first /talk instead of inside it, where it would eat into the ESP32's timeout.
     tts.get_model()
     stt.warmup()
+    acks.prepare(tts.synthesize)
     logger.info("Rocky voice loaded")
 
 
@@ -156,6 +157,16 @@ async def live_next() -> Response:
     return Response(content=wav_bytes, media_type="audio/wav")
 
 
+@app.get("/ack")
+async def ack(turn: str) -> Response:
+    """Opened by the board next to its POST /talk (X-Ack-Id: the same id): a short clip as soon as Rocky has a reason
+    to speak while the answer is on its way, 204 if the answer was quick. See app/acks.py."""
+    wav_bytes = await acks.wait(turn)
+    if not wav_bytes:
+        return Response(status_code=204)
+    return Response(content=wav_bytes, media_type="audio/wav")
+
+
 @app.get("/pending")
 async def pending() -> Response:
     """Polled by the ESP32 while idle: Rocky's announcement of a due timer/reminder as a WAV, or 204 if none.
@@ -192,7 +203,12 @@ async def talk(request: Request, audio: UploadFile | None = File(default=None)) 
         logger.warning("POST /talk rejected: still answering the previous request")
         raise HTTPException(status_code=503, detail="Busy answering the previous request")
     async with _busy:
-        return await _talk(request, audio)
+        turn = request.headers.get("x-ack-id")
+        acks.open_turn(turn)
+        try:
+            return await _talk(request, audio)
+        finally:
+            acks.close_turn(turn)
 
 
 def _input_rms_dbfs(path: str) -> float:

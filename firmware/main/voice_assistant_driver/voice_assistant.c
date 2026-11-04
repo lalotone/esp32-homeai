@@ -10,6 +10,7 @@
 #include "esp_http_client.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -58,6 +59,15 @@ static SemaphoreHandle_t s_speaker_lock;
 #define LIVE_WINDOW_MS          30000
 #define LIVE_SLICE_MS           3000
 #define LIVE_POLL_TIMEOUT_MS    3000
+
+// Acknowledgments: while a question is on its way, a second request (GET /ack) waits for the short clip the API sends
+// when an answer turns out to be slow ("searching, searching"). The API always answers it within seconds.
+#define ACK_HTTP_TIMEOUT_MS     15000
+#define ACK_JOIN_TIMEOUT_MS     5000  // a clip is ~2 s: past this, the answer doesn't wait for it any longer
+#define ACK_ID_LEN              12
+static SemaphoreHandle_t s_ack_done;
+static volatile bool s_ack_running;
+static volatile bool s_ack_cancel;   // the answer arrived: a clip that hasn't started playing is pointless now
 
 #pragma pack(push, 1)
 typedef struct {
@@ -117,8 +127,9 @@ static esp_err_t session_header_handler(esp_http_client_event_t *evt)
 }
 
 // `turn` ("wake" or "follow") tells the API whether this question starts a session.
-static esp_err_t http_post_and_read(const char *url, const char *turn, const uint8_t *body, size_t body_len,
-                                    uint8_t **out_resp, size_t *out_resp_len, session_info_t *out_info)
+// `ack_id` ties it to the GET /ack waiting for a clip ("" if that task couldn't start).
+static esp_err_t http_post_and_read(const char *url, const char *turn, const char *ack_id, const uint8_t *body,
+                                    size_t body_len, uint8_t **out_resp, size_t *out_resp_len, session_info_t *out_info)
 {
     *out_resp = NULL;
     *out_resp_len = 0;
@@ -138,6 +149,9 @@ static esp_err_t http_post_and_read(const char *url, const char *turn, const uin
     }
     esp_http_client_set_header(client, "Content-Type", "audio/wav");
     esp_http_client_set_header(client, "X-Turn", turn);
+    if (ack_id[0]) {
+        esp_http_client_set_header(client, "X-Ack-Id", ack_id);
+    }
 
     esp_err_t err = esp_http_client_open(client, body_len);
     if (err != ESP_OK) {
@@ -328,6 +342,61 @@ static esp_err_t play_wav(const uint8_t *wav, size_t len)
     return play_mono_pcm((const int16_t *)pcm, pcm_len / sizeof(int16_t));
 }
 
+// Runs while one_turn() waits for the answer, so the speaker is free: one_turn() doesn't touch it until ack_finish().
+static void ack_task(void *arg)
+{
+    char *url = arg;
+    int status = 0;
+    uint8_t *resp = NULL;
+    size_t resp_len = 0;
+    if (http_get_and_read(url, ACK_HTTP_TIMEOUT_MS, &status, &resp, &resp_len) == ESP_OK && resp && !s_ack_cancel) {
+        ESP_LOGI(TAG, "Acknowledgment (%u bytes)", (unsigned)resp_len);
+        play_wav(resp, resp_len);
+        led_ring_set_color(255, 255, 0); // back to yellow: still waiting for the answer
+    }
+    free(resp);
+    free(url);
+    s_ack_running = false;
+    xSemaphoreGive(s_ack_done);
+    vTaskDelete(NULL);
+}
+
+// Opens GET /ack for this question and writes its id to `ack_id`; "" if it can't (no clip this time, that's all).
+static void ack_start(char *ack_id, size_t ack_id_size)
+{
+    ack_id[0] = '\0';
+    if (!s_ack_done || s_ack_running) {
+        return; // the last one is still stuck on a bad network: leave it
+    }
+    char *url = malloc(APP_CONFIG_URL_MAX_LEN + 32);
+    if (!url) {
+        return;
+    }
+    char id[ACK_ID_LEN];
+    snprintf(id, sizeof(id), "%08lx", (unsigned long)esp_random());
+    char path[32];
+    snprintf(path, sizeof(path), "/ack?turn=%s", id);
+    api_url(url, APP_CONFIG_URL_MAX_LEN + 32, path);
+    xSemaphoreTake(s_ack_done, 0); // drop a leftover from a clip that outlasted ACK_JOIN_TIMEOUT_MS
+    s_ack_cancel = false;
+    s_ack_running = true;
+    if (xTaskCreatePinnedToCore(ack_task, "ack", 6 * 1024, url, 4, NULL, 0) != pdPASS) {
+        s_ack_running = false;
+        free(url);
+        return;
+    }
+    snprintf(ack_id, ack_id_size, "%s", id);
+}
+
+// The answer arrived (or failed): stops a clip that hasn't started, and waits for one that's playing.
+static void ack_finish(const char *ack_id)
+{
+    if (ack_id[0]) {
+        s_ack_cancel = true;
+        xSemaphoreTake(s_ack_done, pdMS_TO_TICKS(ACK_JOIN_TIMEOUT_MS));
+    }
+}
+
 // Waits for the next question in a session. Normally FOLLOWUP_WINDOW_MS; in Live View
 // LIVE_WINDOW_MS of quiet, in slices, playing any warning the API prepared in between (a
 // warning restarts the wait, so the user can answer it). *live turns false when the API
@@ -436,7 +505,10 @@ static esp_err_t one_turn(bool followup, bool *out_answered, bool *out_end, bool
     uint8_t *resp_buf = NULL;
     size_t resp_len = 0;
     session_info_t info;
-    ret = http_post_and_read(url, followup ? "follow" : "wake", wav_buf, wav_len, &resp_buf, &resp_len, &info);
+    char ack_id[ACK_ID_LEN];
+    ack_start(ack_id, sizeof(ack_id));
+    ret = http_post_and_read(url, followup ? "follow" : "wake", ack_id, wav_buf, wav_len, &resp_buf, &resp_len, &info);
+    ack_finish(ack_id);
     free(wav_buf);
     *out_end = info.end;
     *live = info.live;
@@ -556,6 +628,7 @@ static void announce_task(void *arg)
 esp_err_t voice_assistant_start_announcements(void)
 {
     s_speaker_lock = xSemaphoreCreateMutex();
+    s_ack_done = xSemaphoreCreateBinary(); // NULL just means no acknowledgments
     if (!s_speaker_lock) {
         return ESP_ERR_NO_MEM;
     }

@@ -132,7 +132,7 @@ async def answer(transcript: str) -> str | None:
     """Rocky's spoken answer to a Live View question, straight from a photo. None: it needs the normal way (a tool),
     or the look failed."""
     global _before
-    if _TOOL_ASK.search(transcript):
+    if _TOOL_ASK.search(transcript) or llm.asks_memory(transcript):
         return None
     try:
         jpeg = await photo()

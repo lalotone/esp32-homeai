@@ -15,7 +15,7 @@ import time
 
 import httpx
 
-from . import photos, tools
+from . import memory, photos, tools
 from .config import settings
 
 logger = logging.getLogger("uvicorn.error")
@@ -29,7 +29,8 @@ MAX_TOKENS = 400  # a spoken reply or a tool call is far shorter; stops a runawa
 # llama.cpp with this template). So: an action request that ends with no tool call gets one corrective nudge, and a
 # success claimed without any tool is replaced by an honest "didn't work".
 _ACTION = re.compile(r"\b(wake me|alarm|timer|remind|add|put|remove|delete|clear|cancel|send|set|undo)\b", re.I)
-_CLAIM = re.compile(r"\b(set|added|sent|cancel+ed|removed|cleared|done|ready|on (the|your) list|will wake)\b", re.I)
+_CLAIM = re.compile(r"\b(set|added|sent|cancel+ed|removed|cleared|done|ready|on (the|your) list|will wake|saved|noted|"
+                    r"remember(ed)?|forgotten|forgot)\b", re.I)
 _NUDGE = ("[Check: you called no tool, so nothing was set, added, sent or cancelled. If this request needs a tool, "
           "call it now. If you really must ask the user something first, reply with only that question.]")
 _DIDNT_WORK = "Hmm, Rocky could not do that. Say it again, question?"
@@ -49,6 +50,14 @@ _KNOWLEDGE = re.compile(r"^\W*(why\b|how (do|does|can|could|should|would|to)\b|"
                         r"(?!.*\b(alarm|timer|reminder)s?\b))",
                         re.I)
 _OWN_STATE = re.compile(r"\b(my|our) (\w+ )?(alarm|timer|reminder|list)|\bthe (shopping )?list\b", re.I)
+# "Remember that..." / "forget the coffee thing". Only these turns get the tools that change the memory, and "what do
+# you remember?" isn't one of them: the saved facts are already in the prompt.
+_MEMORY_SAVE = re.compile(r"\b(remember\b(?! (when|how|what|if|the time))|keep in mind|(make|take) a note|note (that|down)|"
+                          r"don'?t forget|do not forget)\b", re.I)
+_MEMORY_DROP = re.compile(r"(?<!don't )(?<!dont )(?<!do not )(?<!\bi )\bforget\b|\bstop remembering\b|"
+                          r"\b(delete|erase|remove)\b.{0,40}\b(memory|memories|note|notes)\b", re.I)
+_MEMORY_UNDO = re.compile(r"\b(undo|bring (it|that|them) back|remember (it|that|them) again)\b", re.I)
+_QUESTION = re.compile(r"^\W*((hey )?rocky\W+)?(what|do|does|did|how|why|when|where|which|who)\b", re.I)
 # A tool call the server couldn't parse comes back as the reply's text (seen with Gemma 4 after a failed call:
 # "<|tool_call>call:calculate{...}"). Never spoken: the round is asked again once, then _DIDNT_WORK.
 _MARKUP = re.compile(r"<\|?/?tool_call|<\|\"\|>|\bcall:\w+\{")
@@ -113,9 +122,37 @@ def _remember(turn: list[dict]) -> None:
     del _history[:-settings.history_turns]
 
 
+def asks_memory(user_text: str) -> bool:
+    """The user asks to save or forget something for good ("what do you remember?" only reads, from the prompt)."""
+    return not _QUESTION.search(user_text) and bool(_MEMORY_SAVE.search(user_text) or _MEMORY_DROP.search(user_text))
+
+
+def _tool_schemas(user_text: str, from_user: bool) -> list[dict]:
+    """All the tools, except the memory ones the user's own words didn't ask for: a headline or a page can't get them."""
+    allowed = set()
+    if from_user and not _QUESTION.search(user_text):
+        if _MEMORY_SAVE.search(user_text):
+            allowed.add("remember")
+        if _MEMORY_DROP.search(user_text):
+            allowed.add("forget_memory")
+        if _MEMORY_UNDO.search(user_text) and memory.can_undo():
+            allowed.add("undo_forget_memory")
+    hidden = tools.MEMORY_TOOLS - allowed
+    return [s for s in tools.schemas() if s["function"]["name"] not in hidden]
+
+
 def is_action(user_text: str) -> bool:
     """The user asks to change something (set, add, send...), so a success can only come from a tool."""
-    return bool(_ACTION.search(user_text)) and (not _KNOWLEDGE.search(user_text) or bool(_OWN_STATE.search(user_text)))
+    return asks_memory(user_text) or (bool(_ACTION.search(user_text))
+                                      and (not _KNOWLEDGE.search(user_text) or bool(_OWN_STATE.search(user_text))))
+
+
+async def _run_offered(client: httpx.AsyncClient, call: dict, offered: set[str]) -> str:
+    name = call["function"]["name"]
+    if name not in offered:
+        logger.warning("refused a call to %s: not offered this round", name)
+        return json.dumps({"error": f"{name} is not available now"})
+    return await tools.run(client, name, call["function"].get("arguments"))
 
 
 async def chat(user_text: str, from_user: bool = True, live: bool = False) -> str:
@@ -144,7 +181,7 @@ async def _chat(user_text: str, from_user: bool = True, live: bool = False) -> t
     """The reply, and this turn's messages (user, tool calls/results, final answer) for the history."""
     url = settings.llm_base_url.rstrip("/") + "/chat/completions"
     turn = [{"role": "user", "content": user_text}]
-    system = settings.system_prompt + (_LIVE_HINT if live else "")
+    system = settings.system_prompt + memory.prompt_block() + (_LIVE_HINT if live else "")
     messages = [{"role": "system", "content": system}, *_recent(), *turn]
     payload = {
         "model": settings.llm_model,
@@ -154,7 +191,7 @@ async def _chat(user_text: str, from_user: bool = True, live: bool = False) -> t
         "stream": False,
     }
     if settings.tools_enabled:
-        payload["tools"] = tools.schemas()
+        payload["tools"] = _tool_schemas(user_text, from_user)
     action = from_user and settings.tools_enabled and is_action(user_text)
     used_tool = nudged = retried = False
     used_names: set[str] = set()
@@ -233,14 +270,17 @@ async def _chat(user_text: str, from_user: bool = True, live: bool = False) -> t
                 turn.append({"role": "assistant", "content": reply})
                 return reply, turn
 
-            used_tool = True
-            used_names |= {c["function"]["name"] for c in calls}
+            # Only what this round offered runs: after a photo or a web page, or without the user asking to change the
+            # memory, a call to anything else is refused, even if the model names it anyway.
+            offered = {t["function"]["name"] for t in payload.get("tools", [])}
+            ran = {c["function"]["name"] for c in calls} & offered
+            used_tool = used_tool or bool(ran)
+            used_names |= ran
             step = [{"role": "assistant", "content": message.get("content") or "", "tool_calls": calls}]
-            results = await asyncio.gather(*(tools.run(client, c["function"]["name"], c["function"].get("arguments"))
-                                             for c in calls))
+            results = await asyncio.gather(*(_run_offered(client, c, offered) for c in calls))
             step += [{"role": "tool", "tool_call_id": c.get("id", ""), "content": r} for c, r in zip(calls, results)]
             messages.extend(step)
-            if any(c["function"]["name"] in UNTRUSTED_TOOLS for c in calls):
+            if ran & UNTRUSTED_TOOLS:
                 # A photo's or a web page's content came from outside: from here on this turn can't act (after a
                 # photo it can still look again or zoom; after a web search, nothing: the photo tools only confused
                 # it), and what it said isn't kept for later turns (which have tools).

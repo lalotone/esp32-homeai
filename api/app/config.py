@@ -125,6 +125,8 @@ class Settings:
     history_ttl_s: float = float(_get("HISTORY_TTL_S", "300"))
     # Timers/reminders file (alerts.json). Mount it on persistent storage to survive restarts.
     state_dir: str = _get("STATE_DIR", "state")
+    # A spoken "thinking, thinking" when an answer takes longer than this (app/acks.py). 0 turns all clips off.
+    ack_after_s: float = float(_get("ACK_AFTER_S", "6"))
     # Homelab status tool: DCGM exporter metrics URL (GPUs) and a path on the GPU node's disk. Empty = skip.
     homelab_dcgm_url: str = _get("HOMELAB_DCGM_URL", "")
     homelab_disk_path: str = _get("HOMELAB_DISK_PATH", "")

@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-from . import alerts, photos, shopping, songs, telegram, websearch
+from . import acks, alerts, memory, photos, shopping, songs, telegram, websearch
 from .config import settings
 
 logger = logging.getLogger("uvicorn.error")
@@ -366,6 +366,20 @@ async def get_shopping_list(client: httpx.AsyncClient) -> dict:
     return {"list": shopping.items()}
 
 
+# --- what Rocky remembers (memory.py) ---
+
+async def remember(client: httpx.AsyncClient, fact: str) -> dict:
+    return memory.remember(fact)
+
+
+async def forget_memory(client: httpx.AsyncClient, about: str) -> dict:
+    return memory.forget(about)
+
+
+async def undo_forget_memory(client: httpx.AsyncClient) -> dict:
+    return memory.undo_forget()
+
+
 async def clear_shopping_list(client: httpx.AsyncClient) -> dict:
     return shopping.clear()
 
@@ -561,7 +575,15 @@ if settings.telegram_photos or (settings.camera_url and settings.camera_token):
     TOOLS["add_photo_item_to_shopping_list"] = (add_photo_item_to_shopping_list, "Put the item shown in the LATEST photo (camera or Telegram) "
                                                 "on the shopping list (\"add the thing in the photo to the list\"). It "
                                                 "looks at the photo itself: never guess the item.", {})
-_REQUIRED = {"calculate": ["expression"], "lookup_wikipedia": ["topic"], "web_search": ["query"], "set_reminder": ["text"], "set_alarm": ["at"],
+# Offered to the model only on a turn where the user's own words ask for it (llm.py).
+MEMORY_TOOLS = {"remember", "forget_memory", "undo_forget_memory"}
+TOOLS["remember"] = (remember, "Save a fact about the user for all future conversations, because they asked you to "
+                     "remember it. Write it as one short plain fact, like \"Takes coffee without sugar\".", {
+    "fact": {"type": "string", "description": "The fact, under 120 characters"}})
+TOOLS["forget_memory"] = (forget_memory, "Forget saved facts about the user, because they asked you to.", {
+    "about": {"type": "string", "description": "A word or two from the fact, like \"coffee\"; or \"everything\""}})
+TOOLS["undo_forget_memory"] = (undo_forget_memory, "Bring back the facts that were just forgotten.", {})
+_REQUIRED = {"remember": ["fact"], "forget_memory": ["about"], "calculate": ["expression"], "lookup_wikipedia": ["topic"], "web_search": ["query"], "set_reminder": ["text"], "set_alarm": ["at"],
              "add_to_shopping_list": ["items"], "remove_from_shopping_list": ["items"], "send_to_phone": ["text"]}
 
 
@@ -580,6 +602,7 @@ SLOW_TOOLS = {"look_through_camera": 45, "look_at_last_photo": 40, "add_photo_it
 async def run(client: httpx.AsyncClient, name: str, arguments: str) -> str:
     """Run one tool call; always returns a JSON string (errors included) for the model."""
     t0 = time.monotonic()
+    acks.tool_started(name)
     try:
         fn = TOOLS[name][0]
         args = json.loads(arguments or "{}")

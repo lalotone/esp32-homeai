@@ -37,6 +37,7 @@ Ask in plain words; the LLM picks the tool (`app/tools.py`). Short-term memory k
 | "Set a timer for 10 minutes", "remind me to call mum at 19:30" | `set_timer`, `set_reminder`, `list_alerts`, `cancel_alert` | `STATE_DIR/alerts.json`; announced by the speaker via `/pending` |
 | "Wake me up at 7:30", "every weekday at 7" | `set_alarm` | same; rings with the morning briefing, composed ~2 min ahead |
 | "Add milk to the list", "clear the list", "undo" | shopping-list tools | `STATE_DIR/shopping.json` |
+| "Remember that I take coffee without sugar", "what do you remember about me?", "forget the coffee thing", "undo" | `remember`, `forget_memory`, `undo_forget_memory` | `STATE_DIR/memory.json`, up to 30 short facts in every prompt. Saved only when you ask; refuses passwords and card numbers |
 | "Good morning!" | `get_morning_briefing` | weather + today's reminders + 2 news + shopping list size |
 | "What song is this?" | `identify_song` | Shazam (unofficial, see below); the speaker's follow-up window records the music |
 | "Send me the list / that recipe", "remind me **on my phone**" | `send_shopping_list`, `send_to_phone` | Telegram bot, one-way to `TELEGRAM_CHAT_ID` only |
@@ -169,7 +170,7 @@ Only use voices you have the right to use, and don't publish clips or outputs cl
 | Where | What | How to set it up |
 |---|---|---|
 | `api/.env` | LLM endpoint/model, Whisper size, device, home location, Telegram token + chat id, any `SYSTEM_PROMPT` override | `first_run.sh` copies `.env.example`; edit it |
-| `api/state/` | timers, alarms, reminders, shopping list | created on first use (`STATE_DIR`) |
+| `api/state/` | timers, alarms, reminders, shopping list, what Rocky remembers, acknowledgment clips | created on first use (`STATE_DIR`) |
 | `api/rocky/` | voice reference | see above |
 | ESP32 NVS | WiFi SSID/password and this server's URL (`http://<this machine's LAN IP>:8000/talk`) | the board's config portal, see [`firmware/README.md`](../firmware/README.md). The committed `sdkconfig` only has placeholders |
 
@@ -302,6 +303,10 @@ Response: `audio/wav` body (the spoken reply). Debug headers:
 content-type, byte count, and transcript for each request.
 
 `GET /health` — `{"status": "ok", "counters": {"answered": N, "silence": N}}`; `GET /stats` — the counters alone.
+
+`GET /ack?turn=<id>` — opened by the speaker next to `POST /talk` (header `X-Ack-Id: <id>`): `200` + a short clip
+("Searching, searching") when a slow tool starts or the answer passes `ACK_AFTER_S` (default 6 s, `0` = off), `204` if
+it was quick. The clips are kept in `STATE_DIR/acks`: delete one to have it made again.
 
 `GET /pending` — polled by the speaker while idle: `200` + WAV with Rocky's announcement when an alarm, timer or
 reminder is due, `204` otherwise (also `204` while a `/talk` is in progress).
